@@ -2641,6 +2641,25 @@ async function handleIntel(url, response) {
 
 // Bars are one minute wide, so refetching every 30s was pure rate-limit burn.
 const OHLCV_CACHE_TTL_MS = Number(process.env.OHLCV_CACHE_TTL_MS || 150000);
+/**
+ * Fallback chart source. Render's free tier shares outbound IPs, so
+ * GeckoTerminal's per-IP budget is spent by other tenants and OHLCV can 429
+ * for long stretches. We sample priceUsd every 15s anyway, so the server can
+ * draw the recent series from its own history rather than showing nothing.
+ */
+function barsFromLocalHistory(chainKey, poolAddress, limit) {
+  const series = historyStore.get(chainKey + ":" + poolAddress);
+  if (!series || !series.samples) return [];
+  return series.samples
+    .filter((sample) => Number.isFinite(sample.priceUsd))
+    .slice(-(limit || 60))
+    .map((sample) => ({
+      t: sample.t,
+      o: sample.priceUsd, h: sample.priceUsd, l: sample.priceUsd, c: sample.priceUsd,
+      v: Number.isFinite(sample.volume5mUsd) ? sample.volume5mUsd : null,
+    }));
+}
+
 const OHLCV_TIMEFRAMES = Object.freeze({ minute: true, hour: true, day: true });
 
 async function handleOhlcv(url, response) {
@@ -2686,6 +2705,17 @@ async function handleOhlcv(url, response) {
     sendJson(response, 200, Object.assign({ reason: data.bars.length ? null : "empty" }, data));
   } catch (error) {
     const limited = error.status === 429 || /429/.test(error.message || "");
+    const local = barsFromLocalHistory(chain.key, pool, limit);
+    if (local.length > 1) {
+      sendJson(response, 200, {
+        server: "ok", chain: chain.key, pool: pool, timeframe: "sampled-15s",
+        aggregate: 1, source: "vibescreener-history", bars: local,
+        reason: "local_history",
+        note: "GeckoTerminal unavailable (" + (limited ? "rate limited" : error.message) +
+          "); drawn from this server's own 15s price samples",
+      });
+      return;
+    }
     sendJson(response, limited ? 200 : 502, {
       server: limited ? "ok" : "error",
       bars: [],
