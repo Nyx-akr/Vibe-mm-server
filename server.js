@@ -173,8 +173,30 @@ function countUpstream(url) {
   upstreamCalls.byHost[host] = (upstreamCalls.byHost[host] || 0) + 1;
 }
 
+/**
+ * GeckoTerminal's keyless tier allows roughly 30 calls a minute. Average usage
+ * sits well under that, but bursts - a few chart opens in quick succession -
+ * blow through it and come back as 429s with no bars drawn. This gate spaces
+ * GT calls out instead, briefly holding a request rather than failing it.
+ */
+const GT_RATE_LIMIT = Number(process.env.GT_RATE_LIMIT || 25);
+const GT_MAX_WAIT_MS = Number(process.env.GT_MAX_WAIT_MS || 6000);
+const gtCallTimes = [];
+
+async function geckoTerminalGate() {
+  const deadline = Date.now() + GT_MAX_WAIT_MS;
+  for (;;) {
+    const now = Date.now();
+    while (gtCallTimes.length && now - gtCallTimes[0] > 60000) gtCallTimes.shift();
+    if (gtCallTimes.length < GT_RATE_LIMIT || now >= deadline) { gtCallTimes.push(now); return; }
+    const waitMs = Math.min(60000 - (now - gtCallTimes[0]) + 50, deadline - now, 1500);
+    await new Promise((resolve) => setTimeout(resolve, Math.max(waitMs, 50)));
+  }
+}
+
 async function fetchJson(url, options) {
   const timeoutMs = (options && options.timeoutMs) || FETCH_TIMEOUT_MS;
+  if (url.indexOf("api.geckoterminal.com") !== -1) await geckoTerminalGate();
   countUpstream(url);
   const startedAt = Date.now();
   const controller = new AbortController();
@@ -2617,6 +2639,8 @@ async function handleIntel(url, response) {
   }
 }
 
+// Bars are one minute wide, so refetching every 30s was pure rate-limit burn.
+const OHLCV_CACHE_TTL_MS = Number(process.env.OHLCV_CACHE_TTL_MS || 150000);
 const OHLCV_TIMEFRAMES = Object.freeze({ minute: true, hour: true, day: true });
 
 async function handleOhlcv(url, response) {
@@ -2633,7 +2657,7 @@ async function handleOhlcv(url, response) {
 
   const key = "ohlcv:" + chain.gt + ":" + pool + ":" + timeframe + ":" + aggregate + ":" + limit;
   try {
-    const data = await cached(key, 30000, async () => {
+    const data = await cached(key, OHLCV_CACHE_TTL_MS, async () => {
       const target = (address) => GT_BASE + "/networks/" + chain.gt + "/pools/" +
         encodeURIComponent(address) + "/ohlcv/" + timeframe +
         "?aggregate=" + aggregate + "&limit=" + limit;
@@ -2659,9 +2683,16 @@ async function handleOhlcv(url, response) {
       return { server: "ok", chain: chain.key, pool: pool, timeframe: timeframe,
         aggregate: aggregate, source: SOURCES.GECKOTERMINAL, bars: bars };
     });
-    sendJson(response, 200, data);
+    sendJson(response, 200, Object.assign({ reason: data.bars.length ? null : "empty" }, data));
   } catch (error) {
-    sendJson(response, 502, { server: "error", bars: [], error: error.message });
+    const limited = error.status === 429 || /429/.test(error.message || "");
+    sendJson(response, limited ? 200 : 502, {
+      server: limited ? "ok" : "error",
+      bars: [],
+      reason: limited ? "rate_limited" : "upstream_error",
+      retryAfterMs: limited ? 20000 : null,
+      error: error.message,
+    });
   }
 }
 
