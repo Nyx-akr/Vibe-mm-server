@@ -21,6 +21,11 @@ const SOURCES = Object.freeze({
   DEXSCREENER: "dexscreener",
   GECKOTERMINAL: "geckoterminal",
   GOPLUS: "goplus",
+  JUPITER: "jupiter",
+  RUGCHECK: "rugcheck",
+  KYBERSWAP: "kyberswap",
+  HONEYPOT: "honeypot.is",
+  DEFILLAMA: "defillama",
 });
 
 // Cloud hosts (Render, Railway, Fly, Heroku) inject PORT and expect the process
@@ -115,6 +120,11 @@ function healthData() {
     providers: {
       geckoterminalConfigured: true,
       dexscreenerConfigured: true,
+      jupiterConfigured: true,
+      rugcheckConfigured: true,
+      kyberswapConfigured: true,
+      honeypotConfigured: true,
+      defillamaConfigured: true,
       birdeyeConfigured: Boolean(process.env.BIRDEYE_API_KEY),
       goplusConfigured: Boolean(process.env.GOPLUS_API_KEY),
     },
@@ -400,6 +410,101 @@ function fetchDexScreenerTokens(addresses) {
     return responses.flatMap((response) =>
       response && Array.isArray(response.pairs) ? response.pairs : []);
   });
+}
+
+/**
+ * Jupiter token API (keyless, Solana only). One batched call covers a whole
+ * feed and carries data no other free source gives us: an organic-flow score,
+ * holder counts with a change rate, a USD buy/sell split per window, circulating
+ * supply and a dev-history audit.
+ */
+const JUP_TOKEN_BASE = "https://lite-api.jup.ag/tokens/v2";
+const JUP_CACHE_TTL_MS = Number(process.env.JUP_CACHE_TTL_MS || 30000);
+const JUP_BATCH = Number(process.env.JUP_BATCH || 40);
+const jupiterCache = new Map();
+
+function normalizeJupiter(token) {
+  if (!token || !token.id) return null;
+  const win = (w) => {
+    const s = token[w];
+    if (!s) return null;
+    const buy = toNumber(s.buyVolume);
+    const sell = toNumber(s.sellVolume);
+    const organic = (toNumber(s.buyOrganicVolume) || 0) + (toNumber(s.sellOrganicVolume) || 0);
+    const total = (buy || 0) + (sell || 0);
+    return {
+      buyUsd: buy, sellUsd: sell,
+      netUsd: buy !== null && sell !== null ? Math.round((buy - sell) * 100) / 100 : null,
+      netRatio: total ? Math.round(((buy - sell) / total) * 1000) / 1000 : null,
+      organicUsd: organic || null,
+      organicSharePct: total ? Math.round((organic / total) * 1000) / 10 : null,
+      numBuys: toNumber(s.numBuys), numSells: toNumber(s.numSells),
+      numTraders: toNumber(s.numTraders), numNetBuyers: toNumber(s.numNetBuyers),
+      numOrganicBuyers: toNumber(s.numOrganicBuyers),
+      holderChangePct: toNumber(s.holderChange),
+      priceChangePct: toNumber(s.priceChange),
+      liquidityChangePct: toNumber(s.liquidityChange),
+    };
+  };
+  const audit = token.audit || {};
+  return {
+    source: SOURCES.JUPITER,
+    holderCount: toNumber(token.holderCount),
+    organicScore: toNumber(token.organicScore),
+    organicScoreLabel: token.organicScoreLabel || null,
+    circSupply: toNumber(token.circSupply),
+    totalSupply: toNumber(token.totalSupply),
+    mcap: toNumber(token.mcap),
+    fdv: toNumber(token.fdv),
+    usdPrice: toNumber(token.usdPrice),
+    launchpad: token.launchpad || null,
+    graduatedAt: token.graduatedAt || null,
+    createdAt: token.createdAt || null,
+    devAddress: token.dev || null,
+    twitter: token.twitter || null,
+    website: token.website || null,
+    tags: Array.isArray(token.tags) ? token.tags : [],
+    audit: {
+      mintAuthorityDisabled: audit.mintAuthorityDisabled ?? null,
+      freezeAuthorityDisabled: audit.freezeAuthorityDisabled ?? null,
+      topHoldersPercentage: toNumber(audit.topHoldersPercentage),
+      devMigrations: toNumber(audit.devMigrations),
+      devMints: toNumber(audit.devMints),
+    },
+    stats5m: win("stats5m"), stats1h: win("stats1h"),
+    stats6h: win("stats6h"), stats24h: win("stats24h"),
+  };
+}
+
+async function fetchJupiterTokens(chain, mints) {
+  if (chain.key !== "solana" || !mints.length) return new Map();
+  const now = Date.now();
+  const out = new Map();
+  const stale = [];
+  mints.forEach((mint) => {
+    const hit = jupiterCache.get(mint);
+    if (hit && now - hit.at < JUP_CACHE_TTL_MS) { if (hit.data) out.set(mint, hit.data); }
+    else stale.push(mint);
+  });
+  const batches = [];
+  for (let i = 0; i < stale.length; i += JUP_BATCH) batches.push(stale.slice(i, i + JUP_BATCH));
+  await Promise.all(batches.map((batch) =>
+    cached("jup:" + batch.join(","), JUP_CACHE_TTL_MS, () =>
+      fetchJson(JUP_TOKEN_BASE + "/search?query=" + batch.join(",")))
+      .then((list) => {
+        const seen = new Set();
+        (Array.isArray(list) ? list : []).forEach((token) => {
+          const norm = normalizeJupiter(token);
+          if (!norm) return;
+          jupiterCache.set(token.id, { at: Date.now(), data: norm });
+          out.set(token.id, norm);
+          seen.add(token.id);
+        });
+        // Cache the misses too, so unknown mints are not re-queried every refresh.
+        batch.forEach((mint) => { if (!seen.has(mint)) jupiterCache.set(mint, { at: Date.now(), data: null }); });
+      })
+      .catch(() => {})));
+  return out;
 }
 
 function pickBestPair(pairs, poolAddress) {
@@ -781,9 +886,15 @@ function computeComponents(row, extras) {
         (z.buyers5m ? ", " + z.buyers5m.multiple + "x 5m baseline" : ""));
     }
   }
+  const jup = extras.jupiter || null;
+  const jupWindow = jup && (jup.stats1h || jup.stats5m || jup.stats24h) ? (jup.stats1h || jup.stats5m || jup.stats24h) : null;
   if (stats && stats.netRatio !== null) {
     set("netDemand", to100(0.5 + stats.netRatio / 2),
       "net $" + stats.netUsd.toLocaleString() + " over " + stats.windowMinutes + "m");
+  } else if (jupWindow && jupWindow.netRatio !== null) {
+    set("netDemand", to100(0.5 + jupWindow.netRatio / 2),
+      "net $" + Math.round(jupWindow.netUsd).toLocaleString() + " of $" +
+      Math.round((jupWindow.buyUsd || 0) + (jupWindow.sellUsd || 0)).toLocaleString() + " (Jupiter USD split)");
   } else if (Number.isFinite(row.buySellRatio24h)) {
     set("netDemand", to100((row.buySellRatio24h - 0.5) / 1.5),
       "buy/sell count ratio " + row.buySellRatio24h.toFixed(2) + " (no USD split yet)");
@@ -811,6 +922,18 @@ function computeComponents(row, extras) {
     const rate = intel.holders.count ? (g.perHour / intel.holders.count) * 100 : 0;
     set("holderGrowth", to100(0.5 + rate * 5),
       (g.perHour > 0 ? "+" : "") + g.perHour + " holders/h on " + intel.holders.count.toLocaleString());
+  } else if (jup && jup.stats1h && Number.isFinite(jup.stats1h.holderChangePct)) {
+    // Jupiter reports the holder delta per window, so this needs no local series.
+    const pct = jup.stats1h.holderChangePct;
+    set("holderGrowth", to100(0.5 + pct / 4),
+      (pct > 0 ? "+" : "") + pct.toFixed(2) + "% holders in 1h" +
+      (jup.holderCount ? " on " + jup.holderCount.toLocaleString() : "") + " (Jupiter)");
+  }
+  if (jup && jup.audit && Number.isFinite(jup.audit.topHoldersPercentage) &&
+      !(intel && intel.holders && intel.holders.topHolderSharePct !== null)) {
+    set("walletQuality", to100(clamp01(1 - jup.audit.topHoldersPercentage / 60)),
+      "top holders " + jup.audit.topHoldersPercentage.toFixed(1) + "% (Jupiter audit)" +
+      (jup.audit.devMigrations ? ", dev has " + jup.audit.devMigrations + " prior migrations" : ""));
   }
   if (intel && intel.holders && intel.holders.topHolderSharePct !== null) {
     const cs = intel.contractSafety || {};
@@ -855,8 +978,23 @@ function computeComponents(row, extras) {
 function computeModifiers(row, extras) {
   const stats = extras.tradeStats;
   const intel = extras.intel;
+  const jup = extras.jupiter;
   const out = {};
 
+  // Jupiter publishes its own organic-flow score (0-100) plus the organic share
+  // of traded volume, so this no longer depends on winning the trade-sampling
+  // rotation. A local trade sample, when we have one, still wins.
+  if (!stats && jup && Number.isFinite(jup.organicScore)) {
+    const share = jup.stats24h ? jup.stats24h.organicSharePct : null;
+    out.organicFlow = {
+      value: Math.round(jup.organicScore),
+      evidence: "Jupiter organic score " + jup.organicScore.toFixed(1) +
+        (jup.organicScoreLabel ? " (" + jup.organicScoreLabel + ")" : "") +
+        (share !== null ? ", " + share + "% of 24h volume organic" : "") +
+        (jup.stats24h && jup.stats24h.numOrganicBuyers !== null
+          ? ", " + jup.stats24h.numOrganicBuyers + " organic buyers" : ""),
+    };
+  }
   if (stats) {
     const spread = clamp01((stats.oneAndDonePct || 0) / 80);
     const concentration = clamp01(1 - (stats.top5SharePct || 0) / 70);
@@ -1121,17 +1259,34 @@ async function buildMarketData({ chain, tokenAddress, feed, limit }) {
 
   const quoteSymbols = Array.from(new Set(bare.map((r) => r.quoteSymbol).filter(Boolean)));
   const references = {};
-  await Promise.all(quoteSymbols.map((symbol) =>
-    usdReferenceFor(symbol).then((ref) => { if (ref) references[symbol] = ref; }).catch(() => {})));
+  const jupiterByMint = new Map();
+  await Promise.all([
+    ...quoteSymbols.map((symbol) =>
+      usdReferenceFor(symbol).then((ref) => { if (ref) references[symbol] = ref; }).catch(() => {})),
+    fetchJupiterTokens(chain, bare.map((r) => r.tokenAddress).filter(Boolean))
+      .then((map) => map.forEach((value, key) => jupiterByMint.set(key, value)))
+      .catch(() => {}),
+  ]);
 
   refreshRotationSlice(chain, bare).catch(() => {});
 
   const rows = bare.map((row) => {
+    row.jupiter = jupiterByMint.get(row.tokenAddress) || null;
+    if (row.jupiter) {
+      if (row.marketCapUsd == null) row.marketCapUsd = row.jupiter.mcap;
+      if (row.fdvUsd == null) row.fdvUsd = row.jupiter.fdv;
+      row.circulatingSupply = row.jupiter.circSupply;
+      row.totalSupply = row.jupiter.totalSupply;
+      row.holderCount = row.jupiter.holderCount;
+      row.launchpad = row.jupiter.launchpad;
+      row.socials = { twitter: row.jupiter.twitter, website: row.jupiter.website };
+    }
     const extras = {
       zScores: zScoresFor(chain.key, row),
       tradeStats: (walletSets.get(chain.key + ":" + row.poolAddress) || {}).stats || null,
       rotation: rotationFor(chain.key, row.poolAddress),
       usdReference: references[row.quoteSymbol] || null,
+      jupiter: row.jupiter,
       intel: null,
     };
     const scored = scoreRow(row, extras);
@@ -1141,7 +1296,10 @@ async function buildMarketData({ chain, tokenAddress, feed, limit }) {
       topReason: topReasonFor(row, extras),
       volumeBaselineMultiple: extras.zScores.metrics.volume5mUsd
         ? extras.zScores.metrics.volume5mUsd.multiple : null,
+      // GeckoTerminal trade sampling when this pool had its rotation turn,
+      // otherwise Jupiter's own USD buy/sell split (no sampling gate).
       flow: extras.tradeStats ? {
+        source: SOURCES.GECKOTERMINAL,
         netUsd: extras.tradeStats.netUsd,
         buyUsd: extras.tradeStats.buyUsd,
         sellUsd: extras.tradeStats.sellUsd,
@@ -1149,7 +1307,17 @@ async function buildMarketData({ chain, tokenAddress, feed, limit }) {
         windowMinutes: extras.tradeStats.windowMinutes,
         organicFlow: organic && !organic.pending ? organic.value : null,
         washRisk: organic && !organic.pending ? 100 - organic.value : null,
-      } : null,
+      } : (row.jupiter && row.jupiter.stats5m ? {
+        source: SOURCES.JUPITER,
+        netUsd: row.jupiter.stats5m.netUsd,
+        buyUsd: row.jupiter.stats5m.buyUsd,
+        sellUsd: row.jupiter.stats5m.sellUsd,
+        distinctWallets: row.jupiter.stats5m.numTraders,
+        windowMinutes: 5,
+        organicSharePct: row.jupiter.stats24h ? row.jupiter.stats24h.organicSharePct : null,
+        organicFlow: organic && !organic.pending ? organic.value : null,
+        washRisk: organic && !organic.pending ? 100 - organic.value : null,
+      } : null),
       rotation: extras.rotation,
     });
   });
@@ -1186,6 +1354,9 @@ async function buildMarketData({ chain, tokenAddress, feed, limit }) {
     providers: [
       { source: SOURCES.GECKOTERMINAL, keyless: true, ok: pools.length > 0, pools: pools.length },
       { source: SOURCES.DEXSCREENER, keyless: true, ok: dexPairs.length > 0, pairs: dexPairs.length },
+      { source: SOURCES.JUPITER, keyless: true, ok: jupiterByMint.size > 0,
+        tokens: jupiterByMint.size,
+        note: chain.key === "solana" ? null : "Solana only" },
     ],
     priceUsd: (rows[0] && rows[0].priceUsd) || null,
     liquidityUsd: (rows[0] && rows[0].liquidityUsd) || null,
@@ -1506,6 +1677,80 @@ function topHolderShare(record) {
   return holders.length ? Math.round(total * 10000) / 100 : null;
 }
 
+/** USDC per EVM chain, for quoting a $10k sell-side route on KyberSwap. */
+const EVM_USDC = Object.freeze({
+  ethereum: { address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", decimals: 6, kyber: "ethereum" },
+  base: { address: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", decimals: 6, kyber: "base" },
+  bsc: { address: "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d", decimals: 18, kyber: "bsc" },
+  arbitrum: { address: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831", decimals: 6, kyber: "arbitrum" },
+  polygon: { address: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", decimals: 6, kyber: "polygon" },
+  avalanche: { address: "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E", decimals: 6, kyber: "avalanche" },
+});
+const HONEYPOT_CHAIN_IDS = Object.freeze({ ethereum: 1, bsc: 56, base: 8453 });
+const LLAMA_CHAIN = Object.freeze({
+  solana: "solana", ethereum: "ethereum", base: "base", bsc: "bsc",
+  arbitrum: "arbitrum", polygon: "polygon", avalanche: "avax",
+});
+
+/** Routed price impact on EVM chains — Jupiter's counterpart, also keyless. */
+async function fetchKyberImpact(chain, tokenAddress) {
+  const usdc = EVM_USDC[chain.key];
+  if (!usdc) return null;
+  const amountIn = BigInt(IMPACT_TRADE_USD) * (10n ** BigInt(usdc.decimals));
+  const url = "https://aggregator-api.kyberswap.com/" + usdc.kyber + "/api/v1/routes" +
+    "?tokenIn=" + usdc.address + "&tokenOut=" + tokenAddress + "&amountIn=" + amountIn.toString();
+  const payload = await fetchJson(url);
+  const summary = payload && payload.data && payload.data.routeSummary;
+  if (!summary) return null;
+  const inUsd = toNumber(summary.amountInUsd);
+  const outUsd = toNumber(summary.amountOutUsd);
+  if (inUsd === null || outUsd === null || !inUsd) return null;
+  return {
+    tradeUsd: IMPACT_TRADE_USD,
+    priceImpactPct: Math.round(((inUsd - outUsd) / inUsd) * 1e6) / 1e4,
+    routes: Array.isArray(summary.route) ? summary.route.length : null,
+    gasUsd: toNumber(summary.gasUsd),
+    source: SOURCES.KYBERSWAP,
+    note: null,
+  };
+}
+
+/** Honeypot + buy/sell tax simulation for EVM chains (GoPlus's cross-check). */
+async function fetchHoneypot(chain, tokenAddress) {
+  const chainId = HONEYPOT_CHAIN_IDS[chain.key];
+  if (!chainId) return null;
+  const payload = await fetchJson(
+    "https://api.honeypot.is/v2/IsHoneypot?address=" + tokenAddress + "&chainID=" + chainId);
+  if (!payload || (!payload.honeypotResult && !payload.simulationResult)) return null;
+  const sim = payload.simulationResult || {};
+  return {
+    isHoneypot: payload.honeypotResult ? Boolean(payload.honeypotResult.isHoneypot) : null,
+    reason: payload.honeypotResult ? payload.honeypotResult.honeypotReason || null : null,
+    buyTaxPct: toNumber(sim.buyTax),
+    sellTaxPct: toNumber(sim.sellTax),
+    transferTaxPct: toNumber(sim.transferTax),
+    flags: ((payload.flags || []).map((f) => f.description || f.flag)).filter(Boolean),
+    source: SOURCES.HONEYPOT,
+  };
+}
+
+/** Independent price, for a third opinion alongside GeckoTerminal and DexScreener. */
+async function fetchLlamaPrice(chain, tokenAddress) {
+  const slug = LLAMA_CHAIN[chain.key];
+  if (!slug) return null;
+  const key = slug + ":" + tokenAddress;
+  const payload = await fetchJson("https://coins.llama.fi/prices/current/" + key);
+  const hit = payload && payload.coins && payload.coins[key];
+  if (!hit) return null;
+  return {
+    priceUsd: toNumber(hit.price),
+    confidence: toNumber(hit.confidence),
+    decimals: toNumber(hit.decimals),
+    updatedAt: toNumber(hit.timestamp),
+    source: SOURCES.DEFILLAMA,
+  };
+}
+
 async function fetchTokenIntel(chain, tokenAddress, row) {
   const sources = {};
   const isSolana = chain.key === "solana";
@@ -1529,8 +1774,49 @@ async function fetchTokenIntel(chain, tokenAddress, row) {
       : Promise.resolve((sources.jupiter = "Solana only", null)),
   ]);
 
+  // Keyless EVM counterparts to Jupiter/RugCheck, plus an independent price.
+  const [kyber, honeypot, llama, jupToken] = await Promise.all([
+    isSolana
+      ? Promise.resolve((sources.kyberswap = "EVM only", null))
+      : fetchKyberImpact(chain, tokenAddress)
+        .then((d) => { sources.kyberswap = d ? "ok" : "no route"; return d; })
+        .catch((e) => { sources.kyberswap = e.message; return null; }),
+    isSolana
+      ? Promise.resolve((sources.honeypot = "EVM only", null))
+      : fetchHoneypot(chain, tokenAddress)
+        .then((d) => { sources.honeypot = d ? "ok" : "no data"; return d; })
+        .catch((e) => { sources.honeypot = e.message; return null; }),
+    fetchLlamaPrice(chain, tokenAddress)
+      .then((d) => { sources.defillama = d ? "ok" : "not indexed"; return d; })
+      .catch((e) => { sources.defillama = e.message; return null; }),
+    isSolana
+      ? fetchJupiterTokens(chain, [tokenAddress])
+        .then((map) => { const d = map.get(tokenAddress) || null; sources.jupiterTokens = d ? "ok" : "not indexed"; return d; })
+        .catch((e) => { sources.jupiterTokens = e.message; return null; })
+      : Promise.resolve((sources.jupiterTokens = "Solana only", null)),
+  ]);
+
   const gpRecord = pickGoPlusRecord(goPlusRaw, tokenAddress);
   const checks = goPlusChecks(chain.key, gpRecord);
+  // honeypot.is actually simulates a buy and a sell, so on EVM it catches what
+  // static GoPlus flags miss. Appended as regular checks.
+  if (honeypot) {
+    if (honeypot.isHoneypot !== null) {
+      checks.push({
+        label: "Sell path works (simulated)", ok: !honeypot.isHoneypot,
+        detail: honeypot.isHoneypot ? (honeypot.reason || "Simulated sell failed") : "Buy and sell both simulate",
+        penalty: 10,
+      });
+    }
+    if (honeypot.buyTaxPct !== null || honeypot.sellTaxPct !== null) {
+      const high = (honeypot.buyTaxPct || 0) > 10 || (honeypot.sellTaxPct || 0) > 10;
+      checks.push({
+        label: "Simulated tax under 10%", ok: !high,
+        detail: "buy " + (honeypot.buyTaxPct || 0).toFixed(1) + "% / sell " + (honeypot.sellTaxPct || 0).toFixed(1) + "%",
+        penalty: 5,
+      });
+    }
+  }
   const failed = checks.filter((c) => !c.ok);
 
   const rugRisks = ((rugRaw && rugRaw.risks) || []).map((r) => ({
@@ -1539,11 +1825,23 @@ async function fetchTokenIntel(chain, tokenAddress, row) {
 
   const goPlusHolders = toNumber(gpRecord && gpRecord.holder_count);
   const rugHolders = toNumber(rugRaw && rugRaw.totalHolders);
-  const holderCount = goPlusHolders !== null ? goPlusHolders : rugHolders;
+  // Holder count: GoPlus, then RugCheck, then Jupiter.
+  const jupHolders = jupToken ? jupToken.holderCount : null;
+  const holderCount = goPlusHolders !== null ? goPlusHolders
+    : (rugHolders !== null ? rugHolders : jupHolders);
   recordHolderCount(chain.key, tokenAddress, holderCount);
 
+  // Jupiter's routed quote on Solana, KyberSwap's on EVM.
   const impactPct = jupRaw && jupRaw.priceImpactPct !== undefined
     ? Math.round(Number(jupRaw.priceImpactPct) * 1e6) / 1e4 : null;
+  const impact = impactPct !== null
+    ? { tradeUsd: IMPACT_TRADE_USD, priceImpactPct: impactPct,
+        routes: jupRaw && jupRaw.routePlan ? jupRaw.routePlan.length : null,
+        source: SOURCES.JUPITER, note: null }
+    : kyber;
+
+  const llamaDeltaPct = llama && llama.priceUsd && row && Number.isFinite(row.priceUsd)
+    ? Math.round(((row.priceUsd - llama.priceUsd) / llama.priceUsd) * 1e4) / 1e2 : null;
 
   const buys24h = row && row.txns24h ? toNumber(row.txns24h.buys) : null;
   const buyers24h = row && row.traders24h ? toNumber(row.traders24h.buyers) : null;
@@ -1562,7 +1860,7 @@ async function fetchTokenIntel(chain, tokenAddress, row) {
     fetchedAt: Date.now(),
     sources: sources,
     contractSafety: {
-      available: Boolean(gpRecord) || Boolean(rugRaw),
+      available: Boolean(gpRecord) || Boolean(rugRaw) || Boolean(honeypot),
       checks: checks,
       failedCount: failed.length,
       penalty: Math.min(20, failed.reduce((sum, c) => sum + c.penalty, 0)),
@@ -1591,23 +1889,39 @@ async function fetchTokenIntel(chain, tokenAddress, row) {
       goplusCount: goPlusHolders,
       rugcheckCount: rugHolders,
       sourcesDisagree: goPlusHolders !== null && rugHolders !== null && goPlusHolders !== rugHolders,
+      jupiterCount: jupHolders,
       topHolderSharePct: topHolderShare(gpRecord),
+      jupiterTopHoldersPct: jupToken && jupToken.audit ? jupToken.audit.topHoldersPercentage : null,
       totalLpProviders: toNumber(rugRaw && rugRaw.totalLPProviders),
       growth: holderGrowth(chain.key, tokenAddress),
+      changePct1h: jupToken && jupToken.stats1h ? jupToken.stats1h.holderChangePct : null,
+      changePct24h: jupToken && jupToken.stats24h ? jupToken.stats24h.holderChangePct : null,
     },
-    impact: {
-      tradeUsd: IMPACT_TRADE_USD,
-      priceImpactPct: impactPct,
-      routes: jupRaw && Array.isArray(jupRaw.routePlan) ? jupRaw.routePlan.length : null,
-      source: isSolana ? "jupiter" : null,
-      note: isSolana ? null : "Routed price impact is Solana-only (Jupiter); no keyless router for this chain",
+    impact: impact || {
+      tradeUsd: IMPACT_TRADE_USD, priceImpactPct: null, routes: null, source: null,
+      note: "No keyless router for this chain",
     },
+    honeypot: honeypot,
+    priceCrossCheck: llama ? {
+      llamaPriceUsd: llama.priceUsd,
+      confidence: llama.confidence,
+      feedPriceUsd: row ? row.priceUsd : null,
+      deltaPct: llamaDeltaPct,
+      source: SOURCES.DEFILLAMA,
+    } : null,
+    supply: jupToken ? {
+      circulating: jupToken.circSupply, total: jupToken.totalSupply, source: SOURCES.JUPITER,
+    } : null,
+    jupiter: jupToken,
     flow: {
       tradesPerBuyer24h: tradesPerBuyer !== null ? Math.round(tradesPerBuyer * 100) / 100 : null,
       volumePerHolderUsd: volumePerHolder !== null ? Math.round(volumePerHolder) : null,
       volumeToLiquidity24h: row ? row.volumeToLiquidity24h : null,
       buyers24h: buyers24h,
       buys24h: buys24h,
+      organicScore: jupToken ? jupToken.organicScore : null,
+      organicSharePct24h: jupToken && jupToken.stats24h ? jupToken.stats24h.organicSharePct : null,
+      netUsd5m: jupToken && jupToken.stats5m ? jupToken.stats5m.netUsd : null,
       notes: flowNotes,
       concernCount: flowNotes.length,
     },
@@ -1727,7 +2041,7 @@ async function scorePoolOnDemand(chain, poolAddress) {
 
   const scored = scoreRow(row, {
     zScores: zScores, tradeStats: tradeStats, rotation: rotationFor(chain.key, poolAddress),
-    usdReference: usdReference, intel: intel,
+    usdReference: usdReference, intel: intel, jupiter: intel ? intel.jupiter : null,
   });
 
   return Object.assign({ server: "ok", pool: poolAddress, fetchedAt: fetchedAt },
@@ -2246,7 +2560,7 @@ async function handleIntel(url, response) {
     const rotation = row ? rotationFor(chain.key, row.poolAddress) : null;
     const scored = row ? scoreRow(row, {
       zScores: zScores, tradeStats: tradeStats, rotation: rotation,
-      usdReference: usdReference, intel: data,
+      usdReference: usdReference, intel: data, jupiter: data ? data.jupiter : null,
     }) : null;
 
     sendJson(response, 200, Object.assign({}, data, {
