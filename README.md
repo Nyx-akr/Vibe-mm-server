@@ -48,6 +48,40 @@ cloud:
 | `HOST` | `0.0.0.0` | Required binding for cloud hosts |
 | `PUBLIC_DIR` | `public` | Static frontend directory (see below) |
 
+## Persistence (optional)
+
+By default the rolling baselines, the stage machine and the holder series live
+in RAM, so they are lost whenever the process restarts — which on Render's free
+tier means every sleep and every deploy.
+
+Set `FIREBASE_SERVICE_ACCOUNT` to a Firebase service-account key (raw JSON on one
+line, or base64) and the server mirrors them to Firestore:
+
+| Collection | One document per | Contents |
+| --- | --- | --- |
+| `poolHistory` | pool | rolling 15s samples as a JSON string |
+| `stages` | token | current stage, `since`, transition history |
+| `holders` | token | holder counts over time |
+
+Samples are buffered in RAM and flushed as **one document per changed pool every
+10 minutes** (`STORE_FLUSH_MS`), which keeps a 60–80 pool feed inside Firestore's
+free 20k writes/day. A flush also runs on `SIGTERM`, so a Render sleep saves the
+buffer rather than dropping it.
+
+No npm dependency is used: the Firestore REST API is called with a
+service-account JWT signed by `node:crypto`. If the credentials are missing or
+invalid the server runs exactly as before and reports it under `store` in
+`/health`.
+
+**A sleeping server still collects nothing.** Persistence removes the amnesia,
+not the gap — pair it with a keep-alive ping (see below) for a continuous series.
+
+## Keeping a free instance awake
+
+Render free services sleep after ~15 minutes without a request. Point any free
+cron service (cron-job.org, UptimeRobot) at `/health` every 10 minutes. One
+always-on service fits inside Render's 750 free instance-hours per month.
+
 ## Deploy on Render
 
 1. Push this folder to a Git repository (its own repo, or a subfolder of the existing one).

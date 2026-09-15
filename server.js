@@ -4,6 +4,7 @@ const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
 const { URL } = require("node:url");
+const store = require("./store");
 
 /**
  * VibeScreener market data server.
@@ -131,6 +132,16 @@ function healthData() {
     chains: Object.keys(CHAINS),
     feeds: Object.keys(FEEDS),
     cacheTtlMs: CACHE_TTL_MS,
+    store: {
+      persistent: store.enabled,
+      backend: store.enabled ? "firestore" : "memory-only",
+      flushIntervalMs: store.flushIntervalMs,
+      writes: store.stats.writes,
+      reads: store.stats.reads,
+      errors: store.stats.errors,
+      lastFlushAt: store.stats.lastFlushAt,
+      lastError: store.stats.lastError,
+    },
     upstream: {
       total: upstreamCalls.total,
       byHost: upstreamCalls.byHost,
@@ -1050,6 +1061,7 @@ function stageFor(chainKey, tokenAddress, score) {
     prior.since = Date.now();
     prior.history.push({ stage: next, at: Date.now() });
     if (prior.history.length > 12) prior.history.shift();
+    store.touchStage(chainKey, tokenAddress);
   }
   return prior;
 }
@@ -1527,6 +1539,23 @@ function recordHistory(chainKey, rows) {
       liquidityUsd: toNumber(row.liquidityUsd),
     });
     if (series.samples.length > HISTORY_MAX_SAMPLES) series.samples.shift();
+    store.touchPool(chainKey, row.poolAddress);
+  });
+}
+
+/**
+ * Baselines are only meaningful over a continuous window. When the service has
+ * been asleep, restored samples can straddle a multi-hour gap, so anything
+ * older than HISTORY_MAX_AGE_MS is dropped before it can skew a z-score.
+ */
+const HISTORY_MAX_AGE_MS = Number(process.env.HISTORY_MAX_AGE_MS || 6 * 3600000);
+
+function pruneHistory() {
+  const cutoff = Date.now() - HISTORY_MAX_AGE_MS;
+  historyStore.forEach((series, key) => {
+    const kept = series.samples.filter((s) => s.t >= cutoff);
+    if (!kept.length) historyStore.delete(key);
+    else series.samples = kept;
   });
 }
 
@@ -1578,6 +1607,7 @@ function recordHolderCount(chainKey, tokenAddress, count) {
   const last = series[series.length - 1];
   const now = Date.now();
   if (!last || now - last.t > 60000) {
+    store.touchHolders(chainKey, tokenAddress);
     series.push({ t: now, count: count });
     if (series.length > 200) series.shift();
     holderHistory.set(key, series);
@@ -2520,6 +2550,9 @@ function handleSystem(url, response) {
       observationTokens: observationStore.size,
       holderSeries: holderHistory.size,
       stagesTracked: stageStore.size,
+      persistent: store.enabled,
+      lastFlushAt: store.stats.lastFlushAt,
+      storeWrites: store.stats.writes,
     },
     limits: {
       geckoterminalPerMinute: 30,
@@ -2710,6 +2743,20 @@ module.exports = {
 
 if (require.main === module) {
   const server = createServer();
+  const stores = { historyStore, stageStore, holderHistory };
+
+  // Restore the series this process would otherwise start empty, then prune
+  // anything stale enough to distort a baseline.
+  store.load(stores).then((result) => {
+    if (!result.enabled) {
+      console.log("Store:       RAM only (set FIREBASE_SERVICE_ACCOUNT to persist across restarts)");
+      return;
+    }
+    pruneHistory();
+    console.log("Store:       Firestore restored " + result.pools + " pool histories, " +
+      result.stages + " stages, " + result.holders + " holder series");
+    store.startAutoFlush(stores);
+  }).catch((error) => console.error("store: load failed -", error.message));
 
   server.listen(PORT, HOST, () => {
     const shown = HOST === "0.0.0.0" || HOST === "::" ? "localhost" : HOST;
@@ -2731,11 +2778,15 @@ if (require.main === module) {
     process.exit(1);
   });
 
-  // Render and most container hosts stop a service with SIGTERM.
+  // Render and most container hosts stop a service with SIGTERM - including
+  // when a free instance is put to sleep. Flushing here means the buffered
+  // samples survive the sleep instead of dying with the process.
   const shutdown = (signal) => () => {
     console.log("Received " + signal + ", shutting down.");
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 10000).unref();
+    store.stopAutoFlush();
+    const done = () => server.close(() => process.exit(0));
+    store.flush(stores, signal.toLowerCase()).then(done).catch(done);
+    setTimeout(() => process.exit(0), 15000).unref();
   };
   process.on("SIGTERM", shutdown("SIGTERM"));
   process.on("SIGINT", shutdown("SIGINT"));
