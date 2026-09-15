@@ -3,6 +3,5 @@ node_modules/
 .env.local
 *.log
 
-# Optional bundled frontend build (copied in from the React app's dist/)
-public/*
-!public/.gitkeep
+# public/ holds the built dashboard (copied in via the React app's
+# `npm run deploy:web`) and IS committed - Render serves it at /.
