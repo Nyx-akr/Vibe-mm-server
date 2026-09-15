@@ -56,7 +56,19 @@ const stats = {
   enabled, projectId: PROJECT_ID,
   writes: 0, reads: 0, errors: 0,
   lastFlushAt: null, lastFlushDocs: 0, lastError: null, loadedAt: null,
+  // Round-trip timings, so the admin panel can show what Firestore costs us.
+  writeLatency: { last: null, avg: null, min: null, max: null, samples: 0 },
+  readLatency: { last: null, avg: null, min: null, max: null, samples: 0 },
+  lastFlushMs: null, lastLoadMs: null,
 };
+
+function recordLatency(bucket, ms) {
+  bucket.last = ms;
+  bucket.min = bucket.min === null ? ms : Math.min(bucket.min, ms);
+  bucket.max = bucket.max === null ? ms : Math.max(bucket.max, ms);
+  bucket.avg = bucket.avg === null ? ms : Math.round((bucket.avg * bucket.samples + ms) / (bucket.samples + 1));
+  bucket.samples += 1;
+}
 
 // ---------------------------------------------------------------- auth
 
@@ -119,11 +131,14 @@ function docId(chainKey, address) {
   return chainKey + "__" + String(address).replace(/\//g, "_");
 }
 
-function writeDoc(collection, id, fields) {
-  return call("/" + collection + "/" + encodeURIComponent(id), {
+async function writeDoc(collection, id, fields) {
+  const startedAt = Date.now();
+  const result = await call("/" + collection + "/" + encodeURIComponent(id), {
     method: "PATCH",
     body: JSON.stringify({ fields: fields }),
   });
+  recordLatency(stats.writeLatency, Date.now() - startedAt);
+  return result;
 }
 
 async function readCollection(collection) {
@@ -131,7 +146,9 @@ async function readCollection(collection) {
   let pageToken = null;
   do {
     const query = "?pageSize=" + LOAD_LIMIT + (pageToken ? "&pageToken=" + encodeURIComponent(pageToken) : "");
+    const readStartedAt = Date.now();
     const page = await call("/" + collection + query, { method: "GET" });
+    recordLatency(stats.readLatency, Date.now() - readStartedAt);
     (page.documents || []).forEach((doc) => out.push(doc));
     pageToken = page.nextPageToken || null;
     stats.reads += (page.documents || []).length;
@@ -162,6 +179,7 @@ function touchObservation(chainKey, tokenAddress) { if (enabled) dirtyObservatio
 async function load(stores) {
   if (!enabled) return { enabled: false };
   const counts = { pools: 0, stages: 0, holders: 0, observations: 0 };
+  const loadStartedAt = Date.now();
   const note = (error) => {
     stats.errors += 1;
     stats.lastError = error.message;
@@ -214,6 +232,7 @@ async function load(stores) {
       });
     }
     stats.loadedAt = Date.now();
+    stats.lastLoadMs = Date.now() - loadStartedAt;
   } catch (error) {
     stats.errors += 1;
     stats.lastError = error.message;
@@ -230,6 +249,7 @@ async function flush(stores, reason) {
   if (!pools.length && !stages.length && !holders.length) return 0;
 
   flushing = true;
+  const flushStartedAt = Date.now();
   let written = 0;
   try {
     for (const id of pools) {
@@ -274,6 +294,7 @@ async function flush(stores, reason) {
     }
     stats.writes += written;
     stats.lastFlushAt = Date.now();
+    stats.lastFlushMs = Date.now() - flushStartedAt;
     stats.lastFlushDocs = written;
     if (written) console.log("store: flushed " + written + " docs (" + (reason || "timer") + ")");
   } catch (error) {
@@ -347,10 +368,84 @@ function flushAll(stores, reason) {
     .then(([a, b]) => a + b);
 }
 
+
+/**
+ * Measures an actual Firestore round trip: one write, then one read back of
+ * the same document. Used by the admin panel's "test now" button so the
+ * numbers shown are current rather than averaged over the process lifetime.
+ */
+async function probe() {
+  if (!enabled) return { enabled: false };
+  const id = "_probe";
+  const stamp = Date.now();
+  const out = { enabled: true, at: stamp };
+  try {
+    const w0 = Date.now();
+    await writeDoc("_admin", id, { at: int(stamp), note: str("admin panel latency probe") });
+    out.writeMs = Date.now() - w0;
+
+    const r0 = Date.now();
+    const doc = await call("/_admin/" + id, { method: "GET" });
+    out.readMs = Date.now() - r0;
+    out.roundTripMs = out.writeMs + out.readMs;
+    out.verified = readInt(doc.fields && doc.fields.at) === stamp;
+  } catch (error) {
+    out.error = error.message;
+    stats.errors += 1;
+    stats.lastError = error.message;
+  }
+  return out;
+}
+
+/**
+ * Lists a collection's documents without their heavy series payloads, so the
+ * admin panel can show what is stored and how fresh it is.
+ */
+async function inspect(collection, limit) {
+  if (!enabled) return { enabled: false, documents: [] };
+  const max = Math.min(Number(limit) || 25, 100);
+  const startedAt = Date.now();
+  const page = await call("/" + collection + "?pageSize=" + max, { method: "GET" });
+  const documents = (page.documents || []).map((doc) => {
+    const f = doc.fields || {};
+    const series = readStr(f.samples) || readStr(f.series) || readStr(f.history) || "";
+    return {
+      id: doc.name.split("/").pop(),
+      chain: readStr(f.chain) || null,
+      symbol: readStr(f.symbol) || null,
+      token: readStr(f.token) || null,
+      pool: readStr(f.pool) || null,
+      stage: readStr(f.stage) || readStr(f.lastStage) || null,
+      sampleCount: readInt(f.sampleCount),
+      firstSampleAt: readInt(f.firstSampleAt),
+      lastSampleAt: readInt(f.lastSampleAt),
+      updatedAt: readInt(f.updatedAt),
+      payloadBytes: series.length,
+      createTime: doc.createTime || null,
+    };
+  });
+  return {
+    enabled: true, collection: collection,
+    fetchedInMs: Date.now() - startedAt,
+    count: documents.length,
+    hasMore: Boolean(page.nextPageToken),
+    documents: documents,
+  };
+}
+
+/** Pending-write counts, for the admin panel's queue view. */
+function pending() {
+  return {
+    pools: dirtyPools.size, stages: dirtyStages.size,
+    holders: dirtyHolders.size, observations: dirtyObservations.size,
+  };
+}
+
 module.exports = {
   enabled, stats,
   flushIntervalMs: FLUSH_MS,
   observationFlushIntervalMs: OBSERVATION_FLUSH_MS,
   load, flush, flushObservations, flushAll, startAutoFlush, stopAutoFlush,
   touchPool, touchStage, touchHolders, touchObservation,
+  probe, inspect, pending,
 };

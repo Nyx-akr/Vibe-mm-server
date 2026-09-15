@@ -5,6 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { URL } = require("node:url");
 const store = require("./store");
+const catalog = require("./catalog");
 
 /**
  * VibeScreener market data server.
@@ -2726,6 +2727,99 @@ async function handleOhlcv(url, response) {
   }
 }
 
+/**
+ * Admin endpoints. Read-only telemetry, but they expose internals, so an
+ * ADMIN_TOKEN can be set to gate them; unset means open.
+ */
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
+
+function adminAllowed(url) {
+  if (!ADMIN_TOKEN) return true;
+  return url.searchParams.get("token") === ADMIN_TOKEN;
+}
+
+function handleCatalog(url, response) {
+  sendJson(response, 200, catalog.payload(SCORE_MODEL));
+}
+
+async function handleAdminStore(url, response) {
+  if (!adminAllowed(url)) { sendJson(response, 401, { server: "error", error: "admin token required" }); return; }
+  const wantsProbe = url.searchParams.get("probe") === "1";
+  const collection = url.searchParams.get("collection");
+  const payload = {
+    server: "ok",
+    now: Date.now(),
+    store: {
+      persistent: store.enabled,
+      backend: store.enabled ? "firestore" : "memory-only",
+      projectId: store.stats.projectId,
+      flushIntervalMs: store.flushIntervalMs,
+      observationFlushIntervalMs: store.observationFlushIntervalMs,
+      writes: store.stats.writes,
+      reads: store.stats.reads,
+      errors: store.stats.errors,
+      lastError: store.stats.lastError,
+      lastFlushAt: store.stats.lastFlushAt,
+      lastFlushDocs: store.stats.lastFlushDocs,
+      lastFlushMs: store.stats.lastFlushMs,
+      loadedAt: store.stats.loadedAt,
+      lastLoadMs: store.stats.lastLoadMs,
+      writeLatency: store.stats.writeLatency,
+      readLatency: store.stats.readLatency,
+      pending: store.pending(),
+    },
+    memory: {
+      historyPools: historyStore.size,
+      stagesTracked: stageStore.size,
+      holderSeries: holderHistory.size,
+      observationTokens: observationStore.size,
+      walletSetsSampled: walletSets.size,
+      cacheEntries: cacheStore.size,
+      inflight: inflight.size,
+      heapUsedMb: Math.round(process.memoryUsage().heapUsed / 1048576),
+      rssMb: Math.round(process.memoryUsage().rss / 1048576),
+      uptimeSeconds: Math.round(process.uptime()),
+      node: process.version,
+    },
+    sampling: {
+      historyGapMs: HISTORY_MIN_GAP_MS,
+      historyMaxSamples: HISTORY_MAX_SAMPLES,
+      historyMaxAgeMs: HISTORY_MAX_AGE_MS,
+      observationGapMs: OBSERVATION_GAP_MS,
+      observationMax: OBSERVATION_MAX,
+      rotationPools: ROTATION_POOLS,
+      rotationRefreshMs: ROTATION_REFRESH_MS,
+    },
+    upstream: {
+      total: upstreamCalls.total,
+      windowSeconds: Math.round((Date.now() - upstreamCalls.since) / 1000),
+      byHost: upstreamCalls.byHost,
+      perMinute: Object.keys(upstreamCalls.byHost).reduce(function (acc, host) {
+        const minutes = Math.max((Date.now() - upstreamCalls.since) / 60000, 1 / 60);
+        acc[host] = Math.round((upstreamCalls.byHost[host] / minutes) * 10) / 10;
+        return acc;
+      }, {}),
+      latency: Object.keys(upstreamLatency).reduce(function (acc, host) {
+        const entry = upstreamLatency[host];
+        const samples = entry.samples.slice().sort(function (a, b) { return a - b; });
+        acc[host] = {
+          calls: entry.calls, errors: entry.errors,
+          medianMs: samples.length ? samples[samples.length >> 1] : null,
+          lastError: entry.lastError,
+        };
+        return acc;
+      }, {}),
+    },
+  };
+  try {
+    if (wantsProbe) payload.probe = await store.probe();
+    if (collection) payload.inspect = await store.inspect(collection, url.searchParams.get("limit"));
+  } catch (error) {
+    payload.inspectError = error.message;
+  }
+  sendJson(response, 200, payload);
+}
+
 function createServer() {
   return http.createServer((request, response) => {
     const url = new URL(request.url || "/", "http://" + (request.headers.host || HOST));
@@ -2772,6 +2866,9 @@ function createServer() {
       handleIntel(url, response);
       return;
     }
+
+    if (url.pathname === "/api/catalog") { handleCatalog(url, response); return; }
+    if (url.pathname === "/api/admin/store") { handleAdminStore(url, response); return; }
 
     if (url.pathname === "/api/ohlcv") {
       handleOhlcv(url, response);
