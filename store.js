@@ -45,6 +45,10 @@ const BASE = enabled
   : null;
 
 const FLUSH_MS = Number(process.env.STORE_FLUSH_MS || 600000);
+// Observations are 60s-granularity score/price snapshots, so they tolerate a
+// longer flush. Keeping them on a slower cycle holds total writes under the
+// free tier's 20k/day: ~60 pools every 10min + ~60 tokens every 30min.
+const OBSERVATION_FLUSH_MS = Number(process.env.STORE_OBSERVATION_FLUSH_MS || 1800000);
 const LOAD_LIMIT = Number(process.env.STORE_LOAD_LIMIT || 300);
 const REQUEST_TIMEOUT_MS = Number(process.env.STORE_TIMEOUT_MS || 12000);
 
@@ -140,13 +144,16 @@ async function readCollection(collection) {
 const dirtyPools = new Set();
 const dirtyStages = new Set();
 const dirtyHolders = new Set();
+const dirtyObservations = new Set();
 let flushTimer = null;
+let observationTimer = null;
 let flushing = false;
 
 /** Marks a pool/token as changed; the next flush writes it. */
 function touchPool(chainKey, poolAddress) { if (enabled) dirtyPools.add(docId(chainKey, poolAddress)); }
 function touchStage(chainKey, tokenAddress) { if (enabled) dirtyStages.add(docId(chainKey, tokenAddress)); }
 function touchHolders(chainKey, tokenAddress) { if (enabled) dirtyHolders.add(docId(chainKey, tokenAddress)); }
+function touchObservation(chainKey, tokenAddress) { if (enabled) dirtyObservations.add(docId(chainKey, tokenAddress)); }
 
 /**
  * Reads every persisted series back into the caller's in-memory Maps.
@@ -154,7 +161,7 @@ function touchHolders(chainKey, tokenAddress) { if (enabled) dirtyHolders.add(do
  */
 async function load(stores) {
   if (!enabled) return { enabled: false };
-  const counts = { pools: 0, stages: 0, holders: 0 };
+  const counts = { pools: 0, stages: 0, holders: 0, observations: 0 };
   const note = (error) => {
     stats.errors += 1;
     stats.lastError = error.message;
@@ -194,6 +201,18 @@ async function load(stores) {
       stores.holderHistory.set(id.replace("__", ":"), series);
       counts.holders += 1;
     });
+
+    // Score/price snapshots per token - the series outcome tracking reads.
+    if (stores.observationStore) {
+      const observations = await readCollection("observations").catch(note);
+      observations.forEach((doc) => {
+        const id = doc.name.split("/").pop();
+        const series = JSON.parse(readStr(doc.fields && doc.fields.series) || "[]");
+        if (!Array.isArray(series) || !series.length) return;
+        stores.observationStore.set(id.replace("__", ":"), series);
+        counts.observations += 1;
+      });
+    }
     stats.loadedAt = Date.now();
   } catch (error) {
     stats.errors += 1;
@@ -217,10 +236,16 @@ async function flush(stores, reason) {
       const series = stores.historyStore.get(id.replace("__", ":"));
       if (!series || !series.samples || !series.samples.length) continue;
       const [chainKey, pool] = id.split("__");
+      const first = series.samples[0];
+      const last = series.samples[series.samples.length - 1];
       await writeDoc("poolHistory", id, {
         chain: str(chainKey), pool: str(pool),
+        // Identity, so a document is readable without cross-referencing the feed.
+        symbol: str(series.symbol || ""),
+        token: str(series.tokenAddress || ""),
         updatedAt: int(Date.now()),
         sampleCount: int(series.samples.length),
+        firstSampleAt: int(first.t), lastSampleAt: int(last.t),
         samples: str(JSON.stringify(series.samples)),
       });
       written += 1;
@@ -261,16 +286,71 @@ async function flush(stores, reason) {
   return written;
 }
 
-function startAutoFlush(stores) {
-  if (!enabled || flushTimer) return;
-  flushTimer = setInterval(() => { flush(stores, "timer").catch(() => {}); }, FLUSH_MS);
-  flushTimer.unref();
+/**
+ * Score/price snapshots, on their own slower cycle. One document per token
+ * holds the whole series, so a longer interval costs nothing but writes.
+ */
+async function flushObservations(stores, reason) {
+  if (!enabled || !stores.observationStore) return 0;
+  const ids = Array.from(dirtyObservations);
+  dirtyObservations.clear();
+  if (!ids.length) return 0;
+  let written = 0;
+  try {
+    for (const id of ids) {
+      const series = stores.observationStore.get(id.replace("__", ":"));
+      if (!series || !series.length) continue;
+      const [chainKey, token] = id.split("__");
+      const last = series[series.length - 1];
+      await writeDoc("observations", id, {
+        chain: str(chainKey), token: str(token),
+        symbol: str(last.symbol || ""),
+        lastStage: str(last.stage || ""), lastScore: int(last.score || 0),
+        sampleCount: int(series.length),
+        firstSampleAt: int(series[0].t), lastSampleAt: int(last.t),
+        series: str(JSON.stringify(series)), updatedAt: int(Date.now()),
+      });
+      written += 1;
+    }
+    stats.writes += written;
+    if (written) console.log("store: flushed " + written + " observation docs (" + (reason || "timer") + ")");
+  } catch (error) {
+    stats.errors += 1;
+    stats.lastError = error.message;
+    console.error("store: observation flush failed -", error.message);
+  }
+  return written;
 }
 
-function stopAutoFlush() { if (flushTimer) { clearInterval(flushTimer); flushTimer = null; } }
+function startAutoFlush(stores) {
+  if (!enabled) return;
+  if (!flushTimer) {
+    flushTimer = setInterval(() => { flush(stores, "timer").catch(() => {}); }, FLUSH_MS);
+    flushTimer.unref();
+  }
+  if (!observationTimer) {
+    observationTimer = setInterval(() => {
+      flushObservations(stores, "timer").catch(() => {});
+    }, OBSERVATION_FLUSH_MS);
+    observationTimer.unref();
+  }
+}
+
+function stopAutoFlush() {
+  if (flushTimer) { clearInterval(flushTimer); flushTimer = null; }
+  if (observationTimer) { clearInterval(observationTimer); observationTimer = null; }
+}
+
+/** Everything, for shutdown. */
+function flushAll(stores, reason) {
+  return Promise.all([flush(stores, reason), flushObservations(stores, reason)])
+    .then(([a, b]) => a + b);
+}
 
 module.exports = {
-  enabled, stats, flushIntervalMs: FLUSH_MS,
-  load, flush, startAutoFlush, stopAutoFlush,
-  touchPool, touchStage, touchHolders,
+  enabled, stats,
+  flushIntervalMs: FLUSH_MS,
+  observationFlushIntervalMs: OBSERVATION_FLUSH_MS,
+  load, flush, flushObservations, flushAll, startAutoFlush, stopAutoFlush,
+  touchPool, touchStage, touchHolders, touchObservation,
 };

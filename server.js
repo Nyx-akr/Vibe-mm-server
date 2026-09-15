@@ -1495,7 +1495,9 @@ async function handleMarket(url, response) {
   }
 }
 
-const HISTORY_MAX_SAMPLES = Number(process.env.HISTORY_MAX_SAMPLES || 120);
+// 480 samples x 15s = a 2h rolling window per pool (~50 KB as stored JSON,
+// far inside Firestore's 1 MiB document cap). Was 120, i.e. only 30 minutes.
+const HISTORY_MAX_SAMPLES = Number(process.env.HISTORY_MAX_SAMPLES || 480);
 const HISTORY_MAX_POOLS = Number(process.env.HISTORY_MAX_POOLS || 600);
 const HISTORY_MIN_GAP_MS = Number(process.env.HISTORY_MIN_GAP_MS || 15000);
 const Z_MIN_SAMPLES = 8;
@@ -1529,6 +1531,9 @@ function recordHistory(chainKey, rows) {
       historyStore.set(key, series);
     }
     series.touchedAt = now;
+    // Identity, so a stored series is readable on its own.
+    series.symbol = row.symbol || series.symbol || null;
+    series.tokenAddress = row.tokenAddress || series.tokenAddress || null;
     const last = series.samples[series.samples.length - 1];
     if (last && now - last.t < HISTORY_MIN_GAP_MS) return;
     series.samples.push({
@@ -1537,6 +1542,7 @@ function recordHistory(chainKey, rows) {
       buys5m: toNumber(row.txns5m && row.txns5m.buys),
       buyers5m: toNumber(row.traders5m && row.traders5m.buyers),
       liquidityUsd: toNumber(row.liquidityUsd),
+      priceUsd: toNumber(row.priceUsd),
     });
     if (series.samples.length > HISTORY_MAX_SAMPLES) series.samples.shift();
     store.touchPool(chainKey, row.poolAddress);
@@ -2095,7 +2101,9 @@ async function handleScore(url, response) {
 }
 
 const OBSERVATION_GAP_MS = Number(process.env.OBSERVATION_GAP_MS || 60000);
-const OBSERVATION_MAX = Number(process.env.OBSERVATION_MAX || 400);
+// 1500 snapshots x 60s = just over 25h, so a 24h outcome can be measured from
+// the stored series alone (~180 KB as JSON).
+const OBSERVATION_MAX = Number(process.env.OBSERVATION_MAX || 1500);
 const observationStore = new Map();
 
 function recordObservations(chainKey, rows) {
@@ -2117,6 +2125,7 @@ function recordObservations(chainKey, rows) {
     });
     if (series.length > OBSERVATION_MAX) series.shift();
     observationStore.set(key, series);
+    store.touchObservation(chainKey, row.tokenAddress);
   });
 }
 
@@ -2743,7 +2752,7 @@ module.exports = {
 
 if (require.main === module) {
   const server = createServer();
-  const stores = { historyStore, stageStore, holderHistory };
+  const stores = { historyStore, stageStore, holderHistory, observationStore };
 
   // Restore the series this process would otherwise start empty, then prune
   // anything stale enough to distort a baseline.
@@ -2754,7 +2763,8 @@ if (require.main === module) {
     }
     pruneHistory();
     console.log("Store:       Firestore restored " + result.pools + " pool histories, " +
-      result.stages + " stages, " + result.holders + " holder series");
+      result.stages + " stages, " + result.holders + " holder series, " +
+      result.observations + " observation series");
     store.startAutoFlush(stores);
   }).catch((error) => console.error("store: load failed -", error.message));
 
@@ -2785,7 +2795,7 @@ if (require.main === module) {
     console.log("Received " + signal + ", shutting down.");
     store.stopAutoFlush();
     const done = () => server.close(() => process.exit(0));
-    store.flush(stores, signal.toLowerCase()).then(done).catch(done);
+    store.flushAll(stores, signal.toLowerCase()).then(done).catch(done);
     setTimeout(() => process.exit(0), 15000).unref();
   };
   process.on("SIGTERM", shutdown("SIGTERM"));
