@@ -403,14 +403,42 @@ function indexIncluded(payload) {
   return new Map(included.map((item) => [item.type + ":" + item.id, item]));
 }
 
+/**
+ * Which pools exist is GeckoTerminal's job, and it changes slowly - so the
+ * list is cached for GT_LIST_TTL_MS while DexScreener refreshes the values on
+ * every request. That split keeps prices fast without spending GeckoTerminal's
+ * ~30/min budget, which on Render's shared IP is the scarcest resource here.
+ *
+ * The last good list per chain is also kept: when GeckoTerminal 429s, we serve
+ * the previous pool list and let DexScreener price it, instead of blanking the
+ * whole chain.
+ */
+const GT_LIST_TTL_MS = Number(process.env.GT_LIST_TTL_MS || 180000);
+const lastGoodFeed = new Map();
+
 function fetchGeckoTerminalFeed(chain, feed) {
   const build = FEEDS[feed] || FEEDS.trending;
-  return cached("gt:feed:" + chain.gt + ":" + feed, GT_CACHE_TTL_MS, async () => {
-    const payload = await fetchJson(build(chain.gt));
-    return {
-      pools: Array.isArray(payload && payload.data) ? payload.data : [],
-      included: indexIncluded(payload),
-    };
+  const key = chain.gt + ":" + feed;
+  return cached("gt:feed:" + key, GT_LIST_TTL_MS, async () => {
+    try {
+      const payload = await fetchJson(build(chain.gt));
+      const result = {
+        pools: Array.isArray(payload && payload.data) ? payload.data : [],
+        included: indexIncluded(payload),
+        listFetchedAt: Date.now(),
+        stale: false,
+      };
+      if (result.pools.length) lastGoodFeed.set(key, result);
+      return result;
+    } catch (error) {
+      const previous = lastGoodFeed.get(key);
+      if (previous) {
+        console.log("gt list unavailable for " + key + " (" + error.message +
+          "), serving list from " + Math.round((Date.now() - previous.listFetchedAt) / 1000) + "s ago");
+        return Object.assign({}, previous, { stale: true, staleReason: error.message });
+      }
+      throw error;
+    }
   });
 }
 
@@ -1246,12 +1274,20 @@ async function buildMarketData({ chain, tokenAddress, feed, limit }) {
 
   let pools = [];
   let included = new Map();
+  let feedResult = {};
   try {
-    const result = tokenAddress
+    feedResult = tokenAddress
       ? await fetchGeckoTerminalTokenPools(chain, tokenAddress)
       : await fetchGeckoTerminalFeed(chain, feed);
-    pools = result.pools;
-    included = result.included;
+    pools = feedResult.pools;
+    included = feedResult.included;
+    if (feedResult.stale) {
+      errors.push({
+        source: SOURCES.GECKOTERMINAL,
+        message: "pool list is stale (" + feedResult.staleReason + "); values still live from DexScreener",
+        severity: "warning",
+      });
+    }
   } catch (error) {
     errors.push({ source: SOURCES.GECKOTERMINAL, message: error.message });
   }
@@ -1386,8 +1422,18 @@ async function buildMarketData({ chain, tokenAddress, feed, limit }) {
     tokenAddress: tokenAddress || (rows[0] && rows[0].tokenAddress) || null,
     fetchedAt: fetchedAt,
     fetchedAtIso: new Date(fetchedAt).toISOString(),
+    poolList: {
+      source: SOURCES.GECKOTERMINAL,
+      fetchedAt: feedResult.listFetchedAt || fetchedAt,
+      stale: Boolean(feedResult.stale),
+      staleReason: feedResult.staleReason || null,
+      ttlMs: GT_LIST_TTL_MS,
+    },
+    valuesFrom: SOURCES.DEXSCREENER,
     providers: [
-      { source: SOURCES.GECKOTERMINAL, keyless: true, ok: pools.length > 0, pools: pools.length },
+      { source: SOURCES.GECKOTERMINAL, keyless: true, ok: pools.length > 0, pools: pools.length,
+        role: "pool discovery (list refreshed every " + Math.round(GT_LIST_TTL_MS / 1000) + "s)",
+        stale: Boolean(feedResult.stale) },
       { source: SOURCES.DEXSCREENER, keyless: true, ok: dexPairs.length > 0, pairs: dexPairs.length },
       { source: SOURCES.JUPITER, keyless: true, ok: jupiterByMint.size > 0,
         tokens: jupiterByMint.size,
