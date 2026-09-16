@@ -15,11 +15,13 @@ const SOURCES = [
     limit: "~30 req/min per IP (shared on Render free tier)",
     endpoints: ["/networks/{net}/trending_pools", "/pools/{pool}/ohlcv/minute", "/pools/{pool}/trades"],
     provides: "price, liquidity, volume 5m/1h/24h, txns, traders, pool age, OHLCV bars, wallet-level trades",
+    role: "pool discovery - decides which pools exist; the list is cached 3 min and the last good list is reused when it rate-limits",
   },
   {
     id: "dexscreener", label: "DexScreener", keyless: true, limit: "~300 req/min",
     endpoints: ["/latest/dex/tokens/{addresses}"],
     provides: "price, liquidity, volume, market cap, FDV, txns, socials - preferred over GeckoTerminal where both answer",
+    role: "pricing - refreshed on every request, so values move at DexScreener's pace rather than the list's",
   },
   {
     id: "jupiter", label: "Jupiter", keyless: true, chains: "Solana only",
@@ -191,6 +193,28 @@ const PANELS = [
   },
 ];
 
+
+/**
+ * How data moves through the server, for the admin panel's pipeline view.
+ * Kept here so the page describes the system as it is rather than as it was.
+ */
+const PIPELINE = [
+  { stage: "1. Discover", detail: "GeckoTerminal trending_pools decides which pools exist, per chain.",
+    cadence: "list cached 3 min (GT_LIST_TTL_MS); last good list reused on a 429" },
+  { stage: "2. Refresh", detail: "DexScreener prices the discovered pools; GeckoTerminal fills anything it lacks.",
+    cadence: "every request (1s cache)" },
+  { stage: "3. Warm", detail: "A background loop refreshes one chain at a time so eight chains never burst GeckoTerminal at once, and samples keep accruing with nobody watching.",
+    cadence: "one chain every 20s, full cycle 160s (WARM_INTERVAL_MS x ACTIVE_CHAINS)" },
+  { stage: "4. Enrich", detail: "On demand for one token: Jupiter or KyberSwap impact, GoPlus and RugCheck safety, honeypot.is simulation, DefiLlama price check.",
+    cadence: "5 min cache, fetched when a detail tab opens" },
+  { stage: "5. Calculate", detail: "calculations/index.js turns raw provider rows into components, modifiers, risk flags, stages and summaries. server.js does no maths.",
+    cadence: "per request" },
+  { stage: "6. Remember", detail: "15s pool samples, 60s score/price observations, stage transitions and holder counts held in RAM.",
+    cadence: "samples every 15s, observations every 60s" },
+  { stage: "7. Persist", detail: "Firestore mirrors those series so they survive sleeps, deploys and restarts. Optional - off without credentials.",
+    cadence: "pools every 10 min, observations every 30 min, plus a flush on shutdown" },
+];
+
 /** Merges live SCORE_MODEL weights into the documented catalogue. */
 function payload(scoreModel) {
   const weights = {};
@@ -199,6 +223,7 @@ function payload(scoreModel) {
     server: "ok",
     generatedAt: Date.now(),
     sources: SOURCES,
+    pipeline: PIPELINE,
     panels: PANELS.map((panel) => ({
       panel: panel.panel,
       fields: panel.fields.map((field) =>
@@ -207,4 +232,4 @@ function payload(scoreModel) {
   };
 }
 
-module.exports = { SOURCES, PANELS, payload };
+module.exports = { SOURCES, PANELS, PIPELINE, payload };
