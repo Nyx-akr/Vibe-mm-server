@@ -3,7 +3,7 @@
 /**
  * Optional Firestore persistence.
  *
- * The server keeps its raw sample series and holder counts in RAM. On
+ * The server keeps its baselines, stage machine and holder series in RAM. On
  * Render's free tier that RAM is destroyed whenever the service sleeps, deploys
  * or restarts, so those series never grow past the current process. This module
  * mirrors them to Firestore and reloads them on boot.
@@ -159,6 +159,7 @@ async function readCollection(collection) {
 // ---------------------------------------------------------------- api
 
 const dirtyPools = new Set();
+const dirtyStages = new Set();
 const dirtyHolders = new Set();
 const dirtyObservations = new Set();
 let flushTimer = null;
@@ -167,6 +168,7 @@ let flushing = false;
 
 /** Marks a pool/token as changed; the next flush writes it. */
 function touchPool(chainKey, poolAddress) { if (enabled) dirtyPools.add(docId(chainKey, poolAddress)); }
+function touchStage(chainKey, tokenAddress) { if (enabled) dirtyStages.add(docId(chainKey, tokenAddress)); }
 function touchHolders(chainKey, tokenAddress) { if (enabled) dirtyHolders.add(docId(chainKey, tokenAddress)); }
 function touchObservation(chainKey, tokenAddress) { if (enabled) dirtyObservations.add(docId(chainKey, tokenAddress)); }
 
@@ -176,7 +178,7 @@ function touchObservation(chainKey, tokenAddress) { if (enabled) dirtyObservatio
  */
 async function load(stores) {
   if (!enabled) return { enabled: false };
-  const counts = { pools: 0, holders: 0, observations: 0 };
+  const counts = { pools: 0, stages: 0, holders: 0, observations: 0 };
   const loadStartedAt = Date.now();
   const note = (error) => {
     stats.errors += 1;
@@ -193,6 +195,20 @@ async function load(stores) {
       const key = id.replace("__", ":");
       stores.historyStore.set(key, { samples: samples, touchedAt: Date.now() });
       counts.pools += 1;
+    });
+
+    const stages = await readCollection("stages").catch(note);
+    stages.forEach((doc) => {
+      const id = doc.name.split("/").pop();
+      const f = doc.fields || {};
+      const history = JSON.parse(readStr(f.history) || "[]");
+      const stage = readStr(f.stage);
+      if (!stage) return;
+      stores.stageStore.set(id.replace("__", ":"), {
+        stage: stage, since: readInt(f.since) || Date.now(),
+        history: Array.isArray(history) ? history : [],
+      });
+      counts.stages += 1;
     });
 
     const holders = await readCollection("holders").catch(note);
@@ -228,8 +244,9 @@ async function load(stores) {
 async function flush(stores, reason) {
   if (!enabled || flushing) return 0;
   const pools = Array.from(dirtyPools); dirtyPools.clear();
+  const stages = Array.from(dirtyStages); dirtyStages.clear();
   const holders = Array.from(dirtyHolders); dirtyHolders.clear();
-  if (!pools.length && !holders.length) return 0;
+  if (!pools.length && !stages.length && !holders.length) return 0;
 
   flushing = true;
   const flushStartedAt = Date.now();
@@ -250,6 +267,18 @@ async function flush(stores, reason) {
         sampleCount: int(series.samples.length),
         firstSampleAt: int(first.t), lastSampleAt: int(last.t),
         samples: str(JSON.stringify(series.samples)),
+      });
+      written += 1;
+    }
+    for (const id of stages) {
+      const entry = stores.stageStore.get(id.replace("__", ":"));
+      if (!entry) continue;
+      const [chainKey, token] = id.split("__");
+      await writeDoc("stages", id, {
+        chain: str(chainKey), token: str(token),
+        stage: str(entry.stage), since: int(entry.since),
+        history: str(JSON.stringify(entry.history || [])),
+        updatedAt: int(Date.now()),
       });
       written += 1;
     }
@@ -297,6 +326,7 @@ async function flushObservations(stores, reason) {
       await writeDoc("observations", id, {
         chain: str(chainKey), token: str(token),
         symbol: str(last.symbol || ""),
+        lastStage: str(last.stage || ""), lastScore: int(last.score || 0),
         sampleCount: int(series.length),
         firstSampleAt: int(series[0].t), lastSampleAt: int(last.t),
         series: str(JSON.stringify(series)), updatedAt: int(Date.now()),
@@ -406,7 +436,7 @@ async function inspect(collection, limit) {
 /** Pending-write counts, for the admin panel's queue view. */
 function pending() {
   return {
-    pools: dirtyPools.size,
+    pools: dirtyPools.size, stages: dirtyStages.size,
     holders: dirtyHolders.size, observations: dirtyObservations.size,
   };
 }
@@ -416,6 +446,6 @@ module.exports = {
   flushIntervalMs: FLUSH_MS,
   observationFlushIntervalMs: OBSERVATION_FLUSH_MS,
   load, flush, flushObservations, flushAll, startAutoFlush, stopAutoFlush,
-  touchPool, touchHolders, touchObservation,
+  touchPool, touchStage, touchHolders, touchObservation,
   probe, inspect, pending,
 };
