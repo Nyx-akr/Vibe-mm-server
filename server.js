@@ -2827,6 +2827,12 @@ async function handleAdminStore(url, response) {
       uptimeSeconds: Math.round(process.uptime()),
       node: process.version,
     },
+    warm: {
+      chains: ACTIVE_CHAINS,
+      intervalMs: WARM_INTERVAL_MS,
+      fullCycleMs: WARM_INTERVAL_MS * ACTIVE_CHAINS.length,
+      state: warmState,
+    },
     sampling: {
       historyGapMs: HISTORY_MIN_GAP_MS,
       historyMaxSamples: HISTORY_MAX_SAMPLES,
@@ -2864,6 +2870,54 @@ async function handleAdminStore(url, response) {
     payload.inspectError = error.message;
   }
   sendJson(response, 200, payload);
+}
+
+/**
+ * Background refresh, one chain at a time.
+ *
+ * Eight chains asking GeckoTerminal at once is a burst, and on Render's shared
+ * outbound IP a burst is what gets 429'd - in production half the chains came
+ * back empty. Refreshing one chain every WARM_INTERVAL_MS spaces those calls
+ * out so each gets its own slot: every chain is refreshed well inside the
+ * list's 3-minute TTL, user requests hit a warm cache, and a chain that does
+ * fail simply keeps its previous list.
+ *
+ * It also means samples are collected whether or not anyone is watching the
+ * dashboard, which is what the z-score baselines and observation series need.
+ */
+const ACTIVE_CHAINS = String(process.env.ACTIVE_CHAINS ||
+  "solana,ethereum,base,bsc,arbitrum,polygon,avalanche,robinhood")
+  .split(",").map((c) => c.trim()).filter(Boolean);
+const WARM_INTERVAL_MS = Number(process.env.WARM_INTERVAL_MS || 20000);
+let warmIndex = 0;
+let warmTimer = null;
+const warmState = {};
+
+async function warmOneChain() {
+  const key = ACTIVE_CHAINS[warmIndex % ACTIVE_CHAINS.length];
+  warmIndex += 1;
+  const chain = resolveChain(key);
+  if (!chain) return;
+  const startedAt = Date.now();
+  try {
+    const data = await cached("market:" + chain.key + ":trending:" + MAX_ROWS, CACHE_TTL_MS,
+      () => buildMarketData({ chain: chain, tokenAddress: null, feed: "trending", limit: MAX_ROWS }));
+    warmState[chain.key] = {
+      at: Date.now(), ms: Date.now() - startedAt,
+      rows: (data.rows || []).length,
+      stale: Boolean(data.poolList && data.poolList.stale),
+      error: null,
+    };
+  } catch (error) {
+    warmState[chain.key] = { at: Date.now(), ms: Date.now() - startedAt, rows: 0, error: error.message };
+  }
+}
+
+function startWarmLoop() {
+  if (warmTimer) return;
+  warmOneChain().catch(() => {});
+  warmTimer = setInterval(() => { warmOneChain().catch(() => {}); }, WARM_INTERVAL_MS);
+  warmTimer.unref();
 }
 
 function createServer() {
@@ -2981,6 +3035,10 @@ if (require.main === module) {
       : "not bundled (API-only mode) - serve the React build separately"));
     console.log("API:         http://" + shown + ":" + PORT + "/api/market?chain=solana&feed=trending");
     console.log("Health:      http://" + shown + ":" + PORT + "/health");
+    startWarmLoop();
+    console.log("Warm loop:   " + ACTIVE_CHAINS.length + " chains, one every " +
+      Math.round(WARM_INTERVAL_MS / 1000) + "s (full cycle " +
+      Math.round(WARM_INTERVAL_MS * ACTIVE_CHAINS.length / 1000) + "s)");
   });
 
   server.on("error", (error) => {
