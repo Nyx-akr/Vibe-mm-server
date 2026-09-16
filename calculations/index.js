@@ -552,7 +552,11 @@ const MAJOR_MARKET_CAP_USD = Number(process.env.MAJOR_MARKET_CAP_USD || 1e9);
  * bridged majors slipped through the screen.
  */
 function normalizeSymbol(raw) {
-  return String(raw || "").toUpperCase().replace(/^[$]/, "").replace(/.[A-Z]{1,2}$/, "");
+  let symbol = String(raw || "").toUpperCase().trim();
+  if (symbol.charAt(0) === "$") symbol = symbol.slice(1);
+  const dot = symbol.lastIndexOf(".");
+  if (dot > 0 && symbol.length - dot <= 3) symbol = symbol.slice(0, dot);
+  return symbol;
 }
 
 function isMajorToken(row, options) {
