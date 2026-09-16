@@ -274,6 +274,17 @@ async function cached(key, ttlMs, producer) {
   return promise;
 }
 
+/**
+ * Reads the cache without producing on a miss. Scoring needs to know whether
+ * intel is already in hand, and must never block on fetching it.
+ */
+function cachePeek(key) {
+  const hit = cacheStore.get(key);
+  return hit && hit.expiresAt > Date.now() ? hit.value : null;
+}
+
+const intelKey = (chainKey, tokenAddress) => "intel:" + chainKey + ":" + tokenAddress;
+
 function firstDefined(...values) {
   return values.find((value) => value !== undefined && value !== null);
 }
@@ -758,8 +769,58 @@ function fetchPoolTrades(chain, poolAddress) {
 const walletSets = new Map();
 let rotationCursor = 0;
 
+/** Last screened row set per chain, for the enrichment loop to walk. */
+const lastFeedRows = new Map();
+
+/**
+ * Last intel payload per token, held for scoring.
+ *
+ * Deliberately not the TTL cache. The cache decides when intel is refetched;
+ * this decides what the score is built from. If scoring read the cache, then
+ * every token whose intel expired a moment before the enrichment loop came
+ * back round would drop to the smaller input set and its score would jump -
+ * the score has to stop moving for reasons that are not the market.
+ */
+const intelStore = new Map();
+
+function rememberIntel(chainKey, tokenAddress, data) {
+  if (!data || !tokenAddress) return data;
+  intelStore.set(intelKey(chainKey, tokenAddress), { data: data, at: Date.now() });
+  return data;
+}
+
+/** Fetches intel through the shared cache and keeps it for scoring. */
+async function loadIntel(chain, tokenAddress, row) {
+  const data = await cached(intelKey(chain.key, tokenAddress), INTEL_CACHE_TTL_MS,
+    () => fetchTokenIntel(chain, tokenAddress, row));
+  return rememberIntel(chain.key, tokenAddress, data);
+}
+
 const ROTATION_REFRESH_MS = Number(process.env.ROTATION_REFRESH_MS || 20000);
 let lastRotationAt = 0;
+
+/**
+ * The inputs every score is built from.
+ *
+ * The score is renormalised over the weight actually present, so the same row
+ * scored with contract, holder and routed-impact data lands on a different
+ * number than one scored without it. The feed and the Asset Detail header used
+ * to build their own extras separately and so reported two different scores for
+ * one token. Both now call this, and the only thing that varies is whether
+ * intel has been fetched yet.
+ */
+function scoreExtrasFor(chain, row, options) {
+  const opts = options || {};
+  return {
+    zScores: zScoresFor(chain.key, row),
+    tradeStats: (walletSets.get(chain.key + ":" + row.poolAddress) || {}).stats || null,
+    rotation: rotationFor(chain.key, row.poolAddress),
+    usdReference: opts.usdReference || null,
+    jupiter: row.jupiter || null,
+    intel: opts.intel || null,
+    stageFor: stageFor,
+  };
+}
 
 async function refreshRotationSlice(chain, rows) {
   const now = Date.now();
@@ -947,15 +1008,12 @@ async function buildMarketData({ chain, tokenAddress, feed, limit, includeMajors
       row.launchpad = row.jupiter.launchpad;
       row.socials = { twitter: row.jupiter.twitter, website: row.jupiter.website };
     }
-    const extras = {
-      zScores: zScoresFor(chain.key, row),
-      tradeStats: (walletSets.get(chain.key + ":" + row.poolAddress) || {}).stats || null,
-      rotation: rotationFor(chain.key, row.poolAddress),
+    const held = intelStore.get(intelKey(chain.key, row.tokenAddress));
+    const extras = scoreExtrasFor(chain, row, {
       usdReference: references[row.quoteSymbol] || null,
-      jupiter: row.jupiter,
-      intel: null,
-      stageFor: stageFor,
-    };
+      // Whatever the enrichment loop (or a detail request) has already fetched.
+      intel: held ? held.data : null,
+    });
     const scored = scoreRow(row, extras);
     const organic = (scored.scoreModifiers || []).find((m) => m.key === "organicFlow");
     return Object.assign(row, scored, {
@@ -986,9 +1044,13 @@ async function buildMarketData({ chain, tokenAddress, feed, limit, includeMajors
         washRisk: organic && !organic.pending ? 100 - organic.value : null,
       } : null),
       rotation: extras.rotation,
+      // Which input set produced this score, so the UI can say so.
+      scoreBasis: extras.intel ? "intel" : "market",
+      intelAgeMs: held ? Date.now() - held.at : null,
     });
   });
 
+  lastFeedRows.set(chain.key, rows);
   recordObservations(chain.key, rows);
 
   const sourceBreakdown = [];
@@ -1305,7 +1367,13 @@ const RUGCHECK_BASE = "https://api.rugcheck.xyz/v1";
 const JUPITER_BASE = "https://lite-api.jup.ag/swap/v1";
 const SOLANA_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const IMPACT_TRADE_USD = Number(process.env.IMPACT_TRADE_USD || 10000);
-const INTEL_CACHE_TTL_MS = Number(process.env.INTEL_CACHE_TTL_MS || 300000);
+// A full enrichment sweep of 8 chains x 30 rows at one token per 8s takes
+// about 32 minutes, so intel is refetched on a slower clock than that - at 5
+// minutes the loop could never catch up with its own expiries. Contract
+// safety, holder concentration and creator history move on the order of hours;
+// routed price impact is the one input that moves faster, and it is half of
+// one component out of twelve.
+const INTEL_CACHE_TTL_MS = Number(process.env.INTEL_CACHE_TTL_MS || 2700000);
 
 const GOPLUS_CHAIN_IDS = Object.freeze({
   ethereum: "1", bsc: "56", base: "8453", arbitrum: "42161", polygon: "137",
@@ -2166,6 +2234,15 @@ function handleSystem(url, response) {
     node: process.version,
     windowSeconds: Math.round((now - upstreamCalls.since) / 1000),
     providers: providers,
+    // How much of the feed is scored on the full input set. Below 100% some
+    // rows are still scored without contract, holder and impact data.
+    enrich: {
+      enabled: INTEL_ENRICH_ENABLED,
+      intervalMs: INTEL_ENRICH_INTERVAL_MS,
+      intelTtlMs: INTEL_CACHE_TTL_MS,
+      coverage: intelCoverage(),
+      last: enrichState,
+    },
     cache: {
       entries: cacheStore.size,
       inflight: inflight.size,
@@ -2203,23 +2280,30 @@ async function handleIntel(url, response) {
       () => buildMarketData({ chain: chain, tokenAddress: null, feed: "trending", limit: MAX_ROWS }));
     const row = (market.rows || []).find((r) =>
       r.tokenAddress === token || (pool && r.poolAddress === pool)) || null;
-    const data = await cached("intel:" + chain.key + ":" + token, INTEL_CACHE_TTL_MS,
-      () => fetchTokenIntel(chain, token, row));
+    const data = await loadIntel(chain, token, row);
 
-    let tradeStats = null;
+    // The detail view samples this pool's trades even when the rotation cursor
+    // has not reached it. Publishing the sample into walletSets means the next
+    // feed build scores the row from the same numbers rather than from a
+    // staler sample - one score, not two.
     if (row && row.poolAddress) {
       try {
-        tradeStats = tradeStatsFrom(await fetchPoolTrades(chain, row.poolAddress));
-      } catch (error) { tradeStats = null; }
+        const trades = await fetchPoolTrades(chain, row.poolAddress);
+        const perWallet = new Map();
+        trades.forEach((t) => perWallet.set(t.wallet, (perWallet.get(t.wallet) || 0) + t.usd));
+        walletSets.set(chain.key + ":" + row.poolAddress, {
+          at: Date.now(), symbol: row.symbol, wallets: perWallet, stats: tradeStatsFrom(trades),
+        });
+      } catch (error) { /* keep whatever sample the rotation cursor left */ }
     }
+    const tradeStats = row ? (walletSets.get(chain.key + ":" + row.poolAddress) || {}).stats || null : null;
     const usdReference = row ? await usdReferenceFor(row.quoteSymbol).catch(() => null) : null;
-    const zScores = row ? zScoresFor(chain.key, row) : { samples: 0, metrics: {} };
-    const rotation = row ? rotationFor(chain.key, row.poolAddress) : null;
-    const scored = row ? scoreRow(row, {
-      zScores: zScores, tradeStats: tradeStats, rotation: rotation,
-      usdReference: usdReference, intel: data, jupiter: data ? data.jupiter : null,
-      stageFor: stageFor,
-    }) : null;
+    // Identical inputs to the feed's, plus the intel just fetched - which the
+    // feed will read from the same cache on its next build.
+    const extras = row ? scoreExtrasFor(chain, row, { usdReference: usdReference, intel: data }) : null;
+    const zScores = extras ? extras.zScores : { samples: 0, metrics: {} };
+    const rotation = extras ? extras.rotation : null;
+    const scored = row ? Object.assign(scoreRow(row, extras), { scoreBasis: "intel" }) : null;
 
     sendJson(response, 200, Object.assign({}, data, {
       zScores: zScores,
@@ -2380,6 +2464,13 @@ async function handleAdminStore(url, response) {
       fullCycleMs: WARM_INTERVAL_MS * ACTIVE_CHAINS.length,
       state: warmState,
     },
+    enrich: {
+      enabled: INTEL_ENRICH_ENABLED,
+      intervalMs: INTEL_ENRICH_INTERVAL_MS,
+      intelTtlMs: INTEL_CACHE_TTL_MS,
+      coverage: intelCoverage(),
+      last: enrichState,
+    },
     sampling: {
       historyGapMs: HISTORY_MIN_GAP_MS,
       historyMaxSamples: HISTORY_MAX_SAMPLES,
@@ -2460,11 +2551,93 @@ async function warmOneChain() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Intel enrichment
+//
+// Contract safety, holder concentration and routed price impact are three of
+// the twelve score components, and they only exist once /api/intel has run for
+// that token. Running it for every row on every build is four to five upstream
+// calls per token on a shared outbound IP, which the free tier will not carry,
+// so one token is enriched per tick instead. buildMarketData picks up whatever
+// has landed in the cache, and coverage fills in over a few minutes.
+const INTEL_ENRICH_INTERVAL_MS = Number(process.env.INTEL_ENRICH_INTERVAL_MS || 8000);
+const INTEL_ENRICH_ENABLED = process.env.INTEL_ENRICH !== "off";
+let enrichChainIndex = 0;
+let enrichRowIndex = 0;
+let enrichTimer = null;
+const enrichState = { at: 0, chain: null, token: null, ms: 0, done: 0, failed: 0, error: null };
+
+/** The next feed row with no fresh intel, walking chains round-robin. */
+function nextEnrichCandidate() {
+  // One pass over every row of every chain. A fully covered cache costs a walk
+  // and nothing else.
+  let budget = ACTIVE_CHAINS.length * (MAX_ROWS + 1);
+  while (budget > 0) {
+    budget -= 1;
+    const key = ACTIVE_CHAINS[enrichChainIndex % ACTIVE_CHAINS.length];
+    const chain = resolveChain(key);
+    const rows = (chain && lastFeedRows.get(chain.key)) || [];
+    if (enrichRowIndex >= rows.length) {
+      enrichChainIndex += 1;
+      enrichRowIndex = 0;
+      continue;
+    }
+    const row = rows[enrichRowIndex];
+    enrichRowIndex += 1;
+    if (!row || !row.tokenAddress) continue;
+    // The cache, not the store: an expired entry is exactly what needs
+    // refreshing, even though the store keeps scoring it meanwhile.
+    if (cachePeek(intelKey(chain.key, row.tokenAddress))) continue;
+    return { chain: chain, row: row };
+  }
+  return null;
+}
+
+async function enrichOneToken() {
+  const next = nextEnrichCandidate();
+  if (!next) return;
+  const startedAt = Date.now();
+  enrichState.chain = next.chain.key;
+  enrichState.token = next.row.symbol || next.row.tokenAddress;
+  try {
+    // Same key and TTL a detail request uses, so the two never double-fetch.
+    await loadIntel(next.chain, next.row.tokenAddress, next.row);
+    enrichState.done += 1;
+    enrichState.error = null;
+  } catch (error) {
+    enrichState.failed += 1;
+    enrichState.error = error.message;
+  }
+  enrichState.at = Date.now();
+  enrichState.ms = Date.now() - startedAt;
+}
+
+/** How much of the live feed is currently scored on the intel input set. */
+function intelCoverage() {
+  let rows = 0;
+  let covered = 0;
+  lastFeedRows.forEach((list, chainKey) => {
+    (list || []).forEach((row) => {
+      if (!row || !row.tokenAddress) return;
+      rows += 1;
+      if (intelStore.has(intelKey(chainKey, row.tokenAddress))) covered += 1;
+    });
+  });
+  return { rows: rows, covered: covered, pct: rows ? Math.round((covered / rows) * 100) : 0 };
+}
+
+function startEnrichLoop() {
+  if (enrichTimer || !INTEL_ENRICH_ENABLED) return;
+  enrichTimer = setInterval(() => { enrichOneToken().catch(() => {}); }, INTEL_ENRICH_INTERVAL_MS);
+  enrichTimer.unref();
+}
+
 function startWarmLoop() {
   if (warmTimer) return;
   warmOneChain().catch(() => {});
   warmTimer = setInterval(() => { warmOneChain().catch(() => {}); }, WARM_INTERVAL_MS);
   warmTimer.unref();
+  startEnrichLoop();
 }
 
 function createServer() {
