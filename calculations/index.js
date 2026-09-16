@@ -524,10 +524,77 @@ function scoreRow(row, extras) {
   };
 }
 
+/**
+ * Screening is for emerging tokens, so blue chips, stablecoins and wrapped
+ * natives are excluded. They dominate trending pools by volume - a live sample
+ * had USDC as the base token of 19 of 160 rows - without ever being the kind of
+ * asset this dashboard exists to surface.
+ *
+ * Two independent tests, either of which excludes a token:
+ *   - it is a known stablecoin, wrapped native or liquid-staking derivative
+ *   - its market cap is above MAJOR_MARKET_CAP_USD
+ */
+const STABLE_SYMBOLS = new Set([
+  "USDC", "USDT", "DAI", "USDG", "USDE", "USDS", "USDD", "USD1", "USDBC", "USDY",
+  "FDUSD", "TUSD", "PYUSD", "FRAX", "LUSD", "SUSD", "BUSD", "EURC", "GUSD", "CRVUSD",
+]);
+const WRAPPED_OR_MAJOR_SYMBOLS = new Set([
+  "ETH", "WETH", "BTC", "WBTC", "CBBTC", "TBTC", "LBTC",
+  "SOL", "WSOL", "BNB", "WBNB", "AVAX", "WAVAX", "MATIC", "WMATIC", "POL", "WPOL",
+  "HYPE", "WHYPE", "STETH", "WSTETH", "WEETH", "RETH", "EZETH", "RSETH",
+  "SAVAX", "JITOSOL", "MSOL", "BSOL", "JUPSOL", "LINK",
+]);
+const MAJOR_MARKET_CAP_USD = Number(process.env.MAJOR_MARKET_CAP_USD || 1e9);
+
+/**
+ * Bridged assets carry a chain suffix - BTC.b and WETH.e on Avalanche, USDC.e
+ * on several L2s - so the suffix is stripped before matching. Without this,
+ * bridged majors slipped through the screen.
+ */
+function normalizeSymbol(raw) {
+  return String(raw || "").toUpperCase().replace(/^[$]/, "").replace(/.[A-Z]{1,2}$/, "");
+}
+
+function isMajorToken(row, options) {
+  const ceiling = (options && options.maxMarketCapUsd) || MAJOR_MARKET_CAP_USD;
+  const symbol = normalizeSymbol(row && row.symbol);
+  if (STABLE_SYMBOLS.has(symbol) || WRAPPED_OR_MAJOR_SYMBOLS.has(symbol)) return true;
+  const cap = toNumber(row && row.marketCapUsd);
+  return cap !== null && cap > ceiling;
+}
+
+/**
+ * Trending pools list the same token under several pools, so the feed showed
+ * duplicates. Keeps the deepest pool per token and reports what it dropped.
+ */
+function screenRows(rows, options) {
+  const opts = options || {};
+  const excluded = { majors: 0, duplicates: 0 };
+  const byToken = new Map();
+  const kept = [];
+
+  rows.forEach((row) => {
+    if (!opts.includeMajors && isMajorToken(row, opts)) { excluded.majors += 1; return; }
+    const key = row.tokenAddress || row.poolAddress;
+    if (!key) { kept.push(row); return; }
+    const seen = byToken.get(key);
+    if (!seen) { byToken.set(key, row); kept.push(row); return; }
+    excluded.duplicates += 1;
+    // Same token, different pool: keep whichever has the deeper liquidity.
+    if ((toNumber(row.liquidityUsd) || 0) > (toNumber(seen.liquidityUsd) || 0)) {
+      kept[kept.indexOf(seen)] = row;
+      byToken.set(key, row);
+    }
+  });
+
+  return { rows: kept, excluded: excluded };
+}
+
 module.exports = {
   // model definitions
   SCORE_MODEL, SCORE_MODIFIERS, STAGES, HYSTERESIS,
   // scalar helpers
+  isMajorToken, screenRows, MAJOR_MARKET_CAP_USD,
   toNumber, clamp01, to100, multipleScore, logScore, percentDelta, statsFor, median,
   // derived inputs
   tradeStatsFrom, bucketBaselines,

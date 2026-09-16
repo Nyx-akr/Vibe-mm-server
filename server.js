@@ -13,7 +13,7 @@ const calc = require("./calculations");
 const {
   SCORE_MODEL, SCORE_MODIFIERS, STAGES, HYSTERESIS,
   clamp01, to100, multipleScore, logScore, percentDelta, statsFor, median,
-  tradeStatsFrom, bucketBaselines,
+  tradeStatsFrom, bucketBaselines, isMajorToken, screenRows,
   computeComponents, computeModifiers, assessRisk, scoreRow,
   topReasonFor, summarize,
 } = calc;
@@ -861,7 +861,7 @@ function usdReferenceFor(symbol) {
 
 const stageStore = new Map();
 
-async function buildMarketData({ chain, tokenAddress, feed, limit }) {
+async function buildMarketData({ chain, tokenAddress, feed, limit, includeMajors }) {
   const fetchedAt = Date.now();
   const errors = [];
 
@@ -913,12 +913,14 @@ async function buildMarketData({ chain, tokenAddress, feed, limit }) {
     dexPairsByToken.get(key).push(pair);
   }
 
-  const bare = pools
+  // Build every pool the feed returned, screen out majors and duplicate
+  // tokens, then take the requested number of what remains - so the limit
+  // counts tokens worth looking at rather than slots spent on USDC.
+  const built = pools.map((pool) => buildRow(pool, included, chain, dexPairsByToken, fetchedAt));
+  const screened = screenRows(built, { includeMajors: includeMajors });
+  const bare = screened.rows
     .slice(0, limit)
-    .map((pool, index) => Object.assign(
-      { rank: index + 1 },
-      buildRow(pool, included, chain, dexPairsByToken, fetchedAt),
-    ));
+    .map((row, index) => Object.assign({ rank: index + 1 }, row));
   recordHistory(chain.key, bare);
 
   const quoteSymbols = Array.from(new Set(bare.map((r) => r.quoteSymbol).filter(Boolean)));
@@ -1016,6 +1018,13 @@ async function buildMarketData({ chain, tokenAddress, feed, limit }) {
     tokenAddress: tokenAddress || (rows[0] && rows[0].tokenAddress) || null,
     fetchedAt: fetchedAt,
     fetchedAtIso: new Date(fetchedAt).toISOString(),
+    screened: {
+      majorsExcluded: screened.excluded.majors,
+      duplicatesExcluded: screened.excluded.duplicates,
+      poolsSeen: built.length,
+      rowsReturned: rows.length,
+      majorMarketCapUsd: calc.MAJOR_MARKET_CAP_USD,
+    },
     poolList: {
       source: SOURCES.GECKOTERMINAL,
       fetchedAt: feedResult.listFetchedAt || fetchedAt,
@@ -1143,11 +1152,12 @@ async function handleMarket(url, response) {
   const requestedFeed = (url.searchParams.get("feed") || "trending").toLowerCase();
   const feed = FEEDS[requestedFeed] ? requestedFeed : "trending";
   const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || MAX_ROWS, 1), 50);
-  const cacheKey = "market:" + chain.key + ":" + (tokenAddress || feed) + ":" + limit;
+  const includeMajors = url.searchParams.get("includeMajors") === "1";
+  const cacheKey = "market:" + chain.key + ":" + (tokenAddress || feed) + ":" + limit + (includeMajors ? ":all" : "");
 
   try {
     const data = await cached(cacheKey, CACHE_TTL_MS, () =>
-      buildMarketData({ chain: chain, tokenAddress: tokenAddress, feed: feed, limit: limit }));
+      buildMarketData({ chain: chain, tokenAddress: tokenAddress, feed: feed, limit: limit, includeMajors: includeMajors }));
     sendJson(response, 200, data);
   } catch (error) {
     console.error("market error:", error.message);
