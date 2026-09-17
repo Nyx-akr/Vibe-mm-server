@@ -445,21 +445,34 @@ async function handleOhlcv(url, response) {
 }
 
 /** Board threads and paid promotion, unmatched. The app does the matching. */
+/**
+ * Every public social feed we can read without an API key, plus the paid
+ * promotion feed, forwarded raw.
+ *
+ * Matching posts to tickers, counting mentions and unique authors, and
+ * comparing against a baseline all happen in the app. This endpoint only says
+ * what was posted, where, by whom and when - and which sources answered.
+ */
 async function handleSocial(url, response) {
   const chain = requireChain(url, response);
   if (!chain) return;
-  let threads = [];
-  let threadError = null;
-  try { threads = await P.fetchBizThreads(); }
-  catch (error) { threadError = error.message; }
-  let promotion = [];
-  try { promotion = await P.fetchPromotion(chain); }
-  catch (error) { /* promotion is optional */ }
+
+  const [social, promotion] = await Promise.all([
+    P.fetchSocialPosts().catch((error) => ({
+      posts: [], sources: [], error: String(error.message || error).slice(0, 160),
+    })),
+    P.fetchPromotion(chain).catch(() => []),
+  ]);
+
   sendJson(response, 200, {
     server: "ok", chain: chain.key,
-    threads: { source: "4chan /biz/ public catalog", error: threadError, rows: threads },
+    posts: social.posts,
+    sources: social.sources,
     promotion: { source: P.SOURCES.DEXSCREENER, rows: promotion },
-    absent: "X/Twitter and Telegram require paid API keys; Reddit blocks unauthenticated JSON (403).",
+    absent: "X/Twitter has no keyless read tier (api.twitter.com/2 answers 401 " +
+      "to every unauthenticated request; the cheapest read plan is paid), and " +
+      "Telegram exposes no public search. The x.com and t.me LINKS a token " +
+      "advertises still arrive through the DexScreener promotion feed.",
   });
 }
 
