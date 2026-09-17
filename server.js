@@ -468,6 +468,19 @@ async function handleOhlcv(url, response) {
  * comparing against a baseline all happen in the app. This endpoint only says
  * what was posted, where, by whom and when - and which sources answered.
  */
+/**
+ * Every public social feed we can read without an API key, plus the paid
+ * promotion feed, forwarded raw.
+ *
+ * The corpus is about a megabyte and changes every few minutes, while the app
+ * re-reads it every few seconds. `?since=<ms>` closes that gap: when nothing
+ * has been fetched since the caller's copy, the posts are left out and only
+ * the counters come back. The caller keeps what it already holds.
+ *
+ * Matching posts to tickers, counting mentions and unique authors, and
+ * comparing against a baseline all happen in the app. This endpoint only says
+ * what was posted, where, by whom and when - and which sources answered.
+ */
 async function handleSocial(url, response) {
   const chain = requireChain(url, response);
   if (!chain) return;
@@ -479,16 +492,26 @@ async function handleSocial(url, response) {
     P.fetchPromotion(chain).catch(() => []),
   ]);
 
-  sendJson(response, 200, {
+  const corpusAt = P.socialCorpusAt();
+  const since = Number(url.searchParams.get("since") || 0);
+  // Strictly greater: a caller holding the current corpus gets nothing back.
+  const unchanged = Number.isFinite(since) && since > 0 && corpusAt <= since;
+
+  const body = {
     server: "ok", chain: chain.key,
-    posts: social.posts,
+    corpusAt: corpusAt,
+    unchanged: unchanged,
+    postCount: social.posts.length,
     sources: social.sources,
     promotion: { source: P.SOURCES.DEXSCREENER, rows: promotion },
     absent: "X/Twitter has no keyless read tier (api.twitter.com/2 answers 401 " +
       "to every unauthenticated request; the cheapest read plan is paid), and " +
       "Telegram exposes no public search. The x.com and t.me LINKS a token " +
       "advertises still arrive through the DexScreener promotion feed.",
-  });
+  };
+  if (!unchanged) body.posts = social.posts;
+
+  sendJson(response, 200, body);
 }
 
 async function handleReference(url, response) {
