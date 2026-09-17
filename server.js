@@ -361,17 +361,32 @@ async function handleTrades(url, response) {
   const chain = requireChain(url, response);
   if (!chain) return;
   const pool = (url.searchParams.get("pool") || "").trim();
-  try {
-    if (pool) {
+
+  // A refresh that fails is not the same as having nothing. GeckoTerminal
+  // rate-limits this endpoint hard - Render's free tier shares outbound IPs,
+  // so a 429 says more about the neighbours than about the pool - and the
+  // warm loop has usually sampled it already. Throwing that away turned a
+  // slow upstream into an empty screen, so a failed refresh now degrades to
+  // the last good sample and says so in `stale`.
+  let refreshError = null;
+  if (pool) {
+    try {
       const trades = await P.fetchPoolTrades(chain, pool);
       memory.recordTrades(chain.key, pool, url.searchParams.get("symbol"), trades);
+    } catch (error) {
+      refreshError = error.message;
     }
-    sendJson(response, 200, {
-      server: "ok", chain: chain.key, pools: memory.tradesFor(chain.key, pool || null),
-    });
-  } catch (error) {
-    sendJson(response, 502, { server: "error", error: error.message, pools: [] });
   }
+
+  const pools = memory.tradesFor(chain.key, pool || null);
+  if (refreshError && !pools.length) {
+    sendJson(response, 502, { server: "error", error: refreshError, pools: [] });
+    return;
+  }
+  sendJson(response, 200, {
+    server: "ok", chain: chain.key, pools: pools,
+    stale: Boolean(refreshError), refreshError: refreshError,
+  });
 }
 
 async function handleIntel(url, response) {
@@ -674,9 +689,25 @@ const WARM_INTERVAL_MS = Number(process.env.WARM_INTERVAL_MS || 20000);
 const WARM_CHAINS = (process.env.WARM_CHAINS || "solana,ethereum,base,bsc")
   .split(",").map((s) => s.trim()).filter(Boolean);
 const ROTATION_POOLS = Number(process.env.ROTATION_POOLS || 12);
+/**
+ * Pools sampled per cycle. The app's wallet memory only ever learns about
+ * pools this loop has reached, so coverage here is the ceiling on coverage
+ * there. GeckoTerminal is the binding constraint: the feed call plus this many
+ * trade calls has to stay inside its per-minute budget, and a 429 costs the
+ * rest of the cycle, so raise it carefully.
+ */
+const TRADES_PER_CYCLE = Number(process.env.TRADES_PER_CYCLE || 2);
 
 let warmCursor = 0;
-let rotationCursor = 0;
+/**
+ * One cursor PER CHAIN.
+ *
+ * A single shared cursor was advanced by whichever chain happened to run, so
+ * each chain resumed wherever another had left off - pools were skipped for
+ * long stretches and others were resampled early. Per-chain cursors make the
+ * rotation an actual round robin, which is what bounded coverage depends on.
+ */
+const rotationCursors = new Map();
 
 async function warmOneChain() {
   const chainKey = WARM_CHAINS[warmCursor % WARM_CHAINS.length];
@@ -685,15 +716,22 @@ async function warmOneChain() {
   if (!chain) return;
   try {
     const data = await buildFeed({ chain: chain, feed: "trending", limit: MAX_ROWS, tokenAddress: null });
-    // One pool's trades per cycle - GeckoTerminal cannot afford more.
     const pools = (data.rows || []).slice(0, ROTATION_POOLS).filter((r) => r.poolAddress);
     if (pools.length) {
-      const target = pools[rotationCursor % pools.length];
-      rotationCursor += 1;
-      try {
-        const trades = await P.fetchPoolTrades(chain, target.poolAddress);
-        memory.recordTrades(chain.key, target.poolAddress, target.symbol, trades);
-      } catch (error) { /* keep the previous sample */ }
+      let cursor = rotationCursors.get(chain.key) || 0;
+      for (let i = 0; i < Math.min(TRADES_PER_CYCLE, pools.length); i++) {
+        const target = pools[cursor % pools.length];
+        cursor += 1;
+        try {
+          const trades = await P.fetchPoolTrades(chain, target.poolAddress);
+          memory.recordTrades(chain.key, target.poolAddress, target.symbol, trades);
+        } catch (error) {
+          // A rate limit means the rest of this cycle would be refused too, so
+          // stop asking and let the next cycle resume from here.
+          if (String(error.message || "").includes("429")) break;
+        }
+      }
+      rotationCursors.set(chain.key, cursor);
     }
   } catch (error) {
     console.log("warm " + chainKey + " failed: " + error.message);
