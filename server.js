@@ -711,7 +711,15 @@ function createServer() {
 const WARM_INTERVAL_MS = Number(process.env.WARM_INTERVAL_MS || 20000);
 const WARM_CHAINS = (process.env.WARM_CHAINS || "solana,ethereum,base,bsc")
   .split(",").map((s) => s.trim()).filter(Boolean);
-const ROTATION_POOLS = Number(process.env.ROTATION_POOLS || 12);
+/**
+ * How far down the feed the sampler is willing to go.
+ *
+ * This was 12 while the board shows up to MAX_ROWS rows, so rows past the
+ * twelfth were never sampled at all and the app had no wallet read on them -
+ * a permanent hole at the bottom of every board rather than a lag. Matching
+ * MAX_ROWS makes every row the user can see eligible.
+ */
+const ROTATION_POOLS = Number(process.env.ROTATION_POOLS || MAX_ROWS);
 /**
  * Pools sampled per cycle. The app's wallet memory only ever learns about
  * pools this loop has reached, so coverage here is the ceiling on coverage
@@ -741,10 +749,30 @@ async function warmOneChain() {
     const data = await buildFeed({ chain: chain, feed: "trending", limit: MAX_ROWS, tokenAddress: null });
     const pools = (data.rows || []).slice(0, ROTATION_POOLS).filter((r) => r.poolAddress);
     if (pools.length) {
+      // A pool we have NEVER sampled is worth more than refreshing one we
+      // already hold: until it is sampled once, the app has no wallet read on
+      // that token at all and its score is missing an input entirely. A
+      // refresh only makes an existing read newer. So new pools jump the
+      // queue, and the round robin handles everything else.
+      const held = new Set(memory.tradesFor(chain.key, null).map((p) => p.poolAddress));
+      const unseen = pools.filter((r) => !held.has(r.poolAddress));
+
       let cursor = rotationCursors.get(chain.key) || 0;
-      for (let i = 0; i < Math.min(TRADES_PER_CYCLE, pools.length); i++) {
+      const budget = Math.min(TRADES_PER_CYCLE, pools.length);
+      const targets = [];
+      unseen.slice(0, budget).forEach((r) => targets.push(r));
+      // The cursor is cumulative across cycles, so the lap guard has to count
+      // steps taken HERE - comparing the cursor itself to the pool count would
+      // stop the round robin dead after the first few cycles.
+      let steps = 0;
+      while (targets.length < budget && steps < pools.length) {
         const target = pools[cursor % pools.length];
         cursor += 1;
+        steps += 1;
+        if (!targets.some((t) => t.poolAddress === target.poolAddress)) targets.push(target);
+      }
+
+      for (const target of targets) {
         try {
           const trades = await P.fetchPoolTrades(chain, target.poolAddress);
           memory.recordTrades(chain.key, target.poolAddress, target.symbol, trades);
