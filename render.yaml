@@ -3,8 +3,11 @@ services:
     name: vibescreener-server
     runtime: node
     plan: free
-    # Remove `rootDir` if this folder is the root of its own repository.
-    rootDir: vibescreener-server
+    # No rootDir: this repo's root IS the server - server.js, package.json and
+    # store.js all live here. It used to say `rootDir: vibescreener-server`,
+    # pointing at a directory that exists locally but is empty, and git does not
+    # track empty directories - so on Render that path was simply absent and the
+    # service had nothing to build or start.
     buildCommand: npm install
     startCommand: node server.js
     healthCheckPath: /health
