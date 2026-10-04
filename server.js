@@ -592,6 +592,135 @@ async function collectIntel() {
   return { chain: target.chainKey, token: target.token };
 }
 
+/* ---- ethos: reputation of the X account a token advertises ------------- */
+
+/**
+ * Ethos reputation, collected per board token.
+ *
+ * Why the X handle and not the wallet: Ethos scores EVM addresses, and a
+ * Solana address is rejected outright - which would blank our largest chain.
+ * Handles have no such limit, and measured against a live board, 87 of 89
+ * distinct token X accounts came back with a score, on all eight chains.
+ *
+ * What the numbers mean, because two of them look alike and are not:
+ *   0      Ethos has never seen this identity. NOT a bad reputation.
+ *   1200   it exists, with nothing for or against it - the starting score.
+ *   >1200  earned through vouches and positive reviews.
+ *   <1200  held against it.
+ *
+ * Only `profile` handles are the project's own account. A `post` handle came
+ * from a /status/ link, which names whoever wrote that post - several board
+ * tokens advertise an @grok reply as their twitter - so those are collected
+ * and marked, never presented as the project.
+ */
+const ETHOS_INTERVAL_MS = Number(process.env.ETHOS_INTERVAL_MS || 120000);
+/** Reputation moves on the order of days; re-reading it often is waste. */
+const ETHOS_REFRESH_MS = Number(process.env.ETHOS_REFRESH_MS || 1800000);
+
+const ethosScores = new Map();   // handle -> { score, level, at }
+
+/** Every X account the current board advertises, by chain and token. */
+function boardHandles() {
+  const byChain = {};
+  const wanted = new Set();
+  for (const chainKey of COLLECT_CHAINS) {
+    const tokens = {};
+    for (const row of latestFeed.get(chainKey) || []) {
+      if (!row.tokenAddress) continue;
+      const urls = [];
+      const links = (row.links && row.links.socials) || [];
+      for (const link of links) {
+        const isX = /twitter|x\.com/i.test(String(link.type || "")) ||
+          /x\.com|twitter\.com/i.test(String(link.url || ""));
+        if (isX && link.url) urls.push({ url: link.url, from: P.SOURCES.DEXSCREENER });
+      }
+      const jup = row.sources && row.sources.jupiter;
+      if (jup && jup.twitter) urls.push({ url: jup.twitter, from: P.SOURCES.JUPITER });
+
+      for (const entry of urls) {
+        const parsed = P.xHandleFrom(entry.url);
+        if (!parsed) continue;
+        // First wins: DexScreener's socials list is checked before Jupiter's
+        // single field, and a profile link is worth more than a post link.
+        const held = tokens[row.tokenAddress];
+        if (held && !(held.kind === "post" && parsed.kind === "profile")) continue;
+        tokens[row.tokenAddress] = {
+          symbol: row.symbol || null,
+          handle: parsed.handle,
+          kind: parsed.kind,
+          url: entry.url,
+          from: entry.from,
+        };
+        wanted.add(parsed.handle);
+      }
+    }
+    byChain[chainKey] = tokens;
+  }
+  return { byChain: byChain, handles: [...wanted] };
+}
+
+function writeEthos(byChain, fetched, skipped) {
+  const handles = {};
+  ethosScores.forEach((value, handle) => {
+    handles[handle] = { score: value.score, level: value.level, at: value.at };
+  });
+  raw.write("ethos.json", {
+    writtenAt: Date.now(),
+    source: P.SOURCES.ETHOS,
+    api: P.ETHOS_BASE,
+    // Said here rather than in the app, so a reader of the raw file cannot
+    // mistake "never seen" for "badly reviewed".
+    scale: {
+      unknown: 0,
+      neutralStart: 1200,
+      note: "0 means Ethos has no record of this identity, not a bad reputation. " +
+        "1200 is the starting score of an identity with nothing recorded either way.",
+      levels: ["untrusted", "questionable", "neutral", "known", "established", "reputable", "exemplary", "renowned"],
+    },
+    refreshMs: ETHOS_REFRESH_MS,
+    fetched: fetched,
+    skipped: skipped,
+    handles: handles,
+    tokens: byChain,
+  });
+}
+
+async function collectEthos() {
+  const { byChain, handles } = boardHandles();
+  if (!handles.length) return { idle: true };
+
+  const now = Date.now();
+  const stale = handles.filter((h) => {
+    const hit = ethosScores.get(h);
+    return !hit || now - hit.at >= ETHOS_REFRESH_MS;
+  });
+
+  if (!stale.length) {
+    // Still rewrite: the board moved even if no reputation did.
+    writeEthos(byChain, 0, handles.length);
+    return { handles: handles.length, fetched: 0 };
+  }
+
+  const scores = await P.fetchEthosScores(stale.map(P.ethosUserkey));
+  let fetched = 0;
+  for (const handle of stale) {
+    const hit = scores[P.ethosUserkey(handle)];
+    if (!hit) continue;
+    ethosScores.set(handle, { score: hit.score, level: hit.level, at: Date.now() });
+    fetched += 1;
+  }
+
+  // Handles that left the board stop being refreshed; drop them once cold so
+  // the file does not grow without bound.
+  const live = new Set(handles);
+  ethosScores.forEach((value, handle) => {
+    if (!live.has(handle) && now - value.at > 6 * 3600000) ethosScores.delete(handle);
+  });
+
+  writeEthos(byChain, fetched, handles.length - stale.length);
+  return { handles: handles.length, fetched: fetched, scored: ethosScores.size };
+}
+
 /* ---- bars: minute OHLCV per board pool --------------------------------- */
 
 function ohlcvMap(chainKey) {
@@ -1130,6 +1259,7 @@ function start() {
   every("deep", DEEP_INTERVAL_MS, collectDeep);
   every("probe", PROBE_INTERVAL_MS, collectProbe);
   every("scan", SCAN_INTERVAL_MS, collectScan);
+  every("ethos", ETHOS_INTERVAL_MS, collectEthos);
 
   createServer().listen(PORT, HOST, () => {
     const shown = HOST === "0.0.0.0" ? "localhost" : HOST;
