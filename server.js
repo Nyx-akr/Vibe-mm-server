@@ -686,6 +686,13 @@ function writeEthos(byChain, fetched, skipped) {
 }
 
 async function collectEthos() {
+  // Boot restores hundreds of sample sets and can flush a 40MB+ archive, both
+  // of which block the event loop hard enough that an outbound request is
+  // cancelled by its own abort timer firing late. Reputation is the least
+  // urgent thing here - it moves on the order of days - so this pass simply
+  // waits for the storm to pass rather than competing with it.
+  if (process.uptime() < 45) return { idle: true, reason: "boot" };
+
   const { byChain, handles } = boardHandles();
   if (!handles.length) return { idle: true };
 
@@ -718,7 +725,12 @@ async function collectEthos() {
   });
 
   writeEthos(byChain, fetched, handles.length - stale.length);
-  return { handles: handles.length, fetched: fetched, scored: ethosScores.size };
+  return {
+    handles: handles.length, fetched: fetched, scored: ethosScores.size,
+    // A partial pass still writes. Said out loud so a half-covered file is
+    // not mistaken for a complete one.
+    failedBatches: scores.__failedBatches || 0,
+  };
 }
 
 /* ---- bars: minute OHLCV per board pool --------------------------------- */
