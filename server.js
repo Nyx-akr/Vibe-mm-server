@@ -36,6 +36,11 @@ const raw = require("./lib/raw-store");
 // for remote callers, so this collector can be put behind a tunnel. Removing
 // the require and the share.handle() call below restores the old behaviour.
 const share = require("./lib/share");
+// Perp venue listings - which symbols already trade as futures elsewhere.
+const perps = require("./lib/perps");
+// The third store: what the APP computed, kept on disk so every viewer sees the
+// same history instead of only what their own browser happened to witness.
+const appStore = require("./lib/app-store");
 
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -668,6 +673,15 @@ function writeEthos(byChain, fetched, skipped) {
     writtenAt: Date.now(),
     source: P.SOURCES.ETHOS,
     api: P.ETHOS_BASE,
+    // The RECORD THIS FILE PROMISES, per token, whether or not any token has
+    // one yet. A reader that only ever sees tokens Ethos happens to know
+    // cannot tell the difference between "this key is missing for this token"
+    // and "this key does not exist" - so the file states its own shape, and a
+    // reader with no record can still show the format it is waiting for.
+    shape: {
+      token: { symbol: null, handle: null, kind: null, url: null, from: null },
+      profile: { score: null, level: null, at: null },
+    },
     // Said here rather than in the app, so a reader of the raw file cannot
     // mistake "never seen" for "badly reviewed".
     scale: {
@@ -730,6 +744,27 @@ async function collectEthos() {
     // A partial pass still writes. Said out loud so a half-covered file is
     // not mistaken for a complete one.
     failedBatches: scores.__failedBatches || 0,
+  };
+}
+
+/* ---- perps: which tokens already have a futures market elsewhere ------- */
+
+/**
+ * Perp venue listings. Slow clock: a venue adds a market a few times a week,
+ * and the whole answer is three requests, so there is nothing to gain by
+ * asking often.
+ */
+const PERPS_INTERVAL_MS = Number(process.env.PERPS_INTERVAL_MS || 1800000);
+
+async function collectPerps() {
+  // Same reasoning as the ethos pass: reputation and listing data are the
+  // least urgent things here, and boot is the busiest the loop ever gets.
+  if (process.uptime() < 45) return { idle: true, reason: "boot" };
+  const data = await perps.fetchPerpVenues();
+  raw.write("perps.json", data);
+  return {
+    venues: data.venuesReachable + "/" + data.venuesTotal,
+    symbols: data.symbolCount,
   };
 }
 
@@ -1196,7 +1231,54 @@ function createServer() {
     // So the app can tell an unchanged file from a new one without parsing it.
     response.setHeader("Access-Control-Expose-Headers", "ETag");
 
-    if (request.method === "OPTIONS") { response.writeHead(204); response.end(); return; }
+    if (request.method === "OPTIONS") {
+      // The app's trail post is JSON, which makes the browser preflight it and
+      // ask for Content-Type. Answering the preflight grants nothing: the POST
+      // below still refuses anyone but this machine.
+      if (url.pathname === "/app/trail") {
+        response.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+        response.setHeader("Access-Control-Allow-Headers", "Content-Type");
+        response.setHeader("Access-Control-Max-Age", "600");
+      }
+      response.writeHead(204);
+      response.end();
+      return;
+    }
+
+    /**
+     * The ONE write the server accepts: the app posting what it computed, into
+     * the app store. Local callers only.
+     *
+     * The tunnel puts this process on the public internet and every visitor
+     * arrives over loopback, so the socket address alone cannot tell them from
+     * the owner - share.isLocalCaller checks the socket, the forwarding
+     * headers and the Host together. A visitor can read this store; only this
+     * machine can add to it.
+     *
+     * The raw store stays read-only to everyone, always.
+     */
+    if (request.method === "POST" && url.pathname === "/app/trail") {
+      if (!share.isLocalCaller(request)) {
+        sendJson(response, 403, { error: "Writes are accepted from this machine only." });
+        return;
+      }
+      let body = "";
+      let tooBig = false;
+      request.on("data", (chunk) => {
+        body += chunk;
+        if (body.length > 4 * 1024 * 1024) { tooBig = true; request.destroy(); }
+      });
+      request.on("end", () => {
+        if (tooBig) { sendJson(response, 413, { error: "payload too large" }); return; }
+        let payload = null;
+        try { payload = JSON.parse(body); } catch (error) { /* reported below */ }
+        if (!payload) { sendJson(response, 400, { error: "invalid JSON" }); return; }
+        const result = appStore.appendTrail(payload);
+        sendJson(response, result.ok ? 200 : 400, result);
+      });
+      return;
+    }
+
     if (request.method !== "GET" && request.method !== "HEAD") {
       sendJson(response, 405, { error: "Read-only. The raw store is written by the collectors, never by a request." });
       return;
@@ -1208,6 +1290,22 @@ function createServer() {
 
     if (url.pathname.startsWith("/raw/")) {
       raw.serve(decodeURIComponent(url.pathname.slice("/raw/".length)), request, response);
+      return;
+    }
+
+    // The app store, read-only to everyone including the tunnel. The index
+    // tells a reader which hours exist without listing a directory.
+    if (url.pathname === "/app/index.json") {
+      const chain = (url.searchParams.get("chain") || "").trim();
+      sendJson(response, 200, chain
+        ? { chain, hours: appStore.trailIndex(chain) }
+        : { chains: appStore.health().chains });
+      return;
+    }
+    if (url.pathname.startsWith("/app/")) {
+      if (!appStore.serve(decodeURIComponent(url.pathname.slice("/app/".length)), request, response)) {
+        sendJson(response, 404, { error: "not in the app store" });
+      }
       return;
     }
     if (url.pathname === "/health") { sendJson(response, 200, healthData()); return; }
@@ -1272,6 +1370,7 @@ function start() {
   every("probe", PROBE_INTERVAL_MS, collectProbe);
   every("scan", SCAN_INTERVAL_MS, collectScan);
   every("ethos", ETHOS_INTERVAL_MS, collectEthos);
+  every("perps", PERPS_INTERVAL_MS, collectPerps);
 
   createServer().listen(PORT, HOST, () => {
     const shown = HOST === "0.0.0.0" ? "localhost" : HOST;
