@@ -1240,7 +1240,7 @@ function createServer() {
       // The app's trail post is JSON, which makes the browser preflight it and
       // ask for Content-Type. Answering the preflight grants nothing: the POST
       // below still refuses anyone but this machine.
-      if (url.pathname === "/app/trail") {
+      if (url.pathname === "/app/trail" || url.pathname.startsWith("/app/flows/")) {
         response.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
         response.setHeader("Access-Control-Allow-Headers", "Content-Type");
         response.setHeader("Access-Control-Max-Age", "600");
@@ -1284,6 +1284,32 @@ function createServer() {
       return;
     }
 
+    // A user's DATA FLOW arrangement, saved by the app. Same rule as the
+    // trail: this machine writes, everyone reads.
+    const flowPost = request.method === "POST" && /^\/app\/flows\/[a-z0-9-]+\.json$/.test(url.pathname);
+    if (flowPost) {
+      if (!share.isLocalCaller(request)) {
+        sendJson(response, 403, { error: "Writes are accepted from this machine only." });
+        return;
+      }
+      let body = "";
+      let tooBig = false;
+      request.on("data", (chunk) => {
+        body += chunk;
+        if (body.length > 2 * 1024 * 1024) { tooBig = true; request.destroy(); }
+      });
+      request.on("end", () => {
+        if (tooBig) { sendJson(response, 413, { error: "payload too large" }); return; }
+        let doc = null;
+        try { doc = JSON.parse(body); } catch (error) { /* reported below */ }
+        if (!doc) { sendJson(response, 400, { error: "invalid JSON" }); return; }
+        const id = url.pathname.slice("/app/flows/".length).replace(/\.json$/, "");
+        const result = appStore.saveFlow(id, doc);
+        sendJson(response, result.ok ? 200 : 400, result);
+      });
+      return;
+    }
+
     if (request.method !== "GET" && request.method !== "HEAD") {
       sendJson(response, 405, { error: "Read-only. The raw store is written by the collectors, never by a request." });
       return;
@@ -1305,6 +1331,10 @@ function createServer() {
       sendJson(response, 200, chain
         ? { chain, hours: appStore.trailIndex(chain) }
         : { chains: appStore.health().chains });
+      return;
+    }
+    if (url.pathname === "/app/flows/index.json") {
+      sendJson(response, 200, { flows: appStore.flowIndex() });
       return;
     }
     if (url.pathname.startsWith("/app/")) {
