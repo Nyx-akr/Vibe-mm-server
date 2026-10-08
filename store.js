@@ -1,65 +1,51 @@
 "use strict";
 
 /**
- * Optional Firestore persistence.
+ * Local-disk persistence.
  *
- * The server keeps its raw sample series and holder counts in RAM. On
- * Render's free tier that RAM is destroyed whenever the service sleeps, deploys
- * or restarts, so those series never grow past the current process. This module
- * mirrors them to Firestore and reloads them on boot.
+ * The server keeps its raw sample series and holder counts in RAM, and that RAM
+ * is destroyed on every restart. This module mirrors them to a file on the
+ * machine and reloads them on boot, so the series outlive the process.
  *
- * It is entirely optional: with no credentials configured every call is a no-op
- * and the server behaves exactly as it did before.
+ * It replaces an earlier cloud mirror, and that removed a constraint rather
+ * than just swapping a backend: the old backend billed per write, so samples
+ * had to be buffered and flushed every TEN MINUTES to ration them. A local
+ * append has no such price, so the flush interval drops to 30s and the
+ * archive is effectively realtime. Do not slow it down again - that was
+ * billing, not durability.
  *
- * No npm dependencies - the Firestore REST API is called directly, with a
- * service-account JWT signed by node:crypto.
+ * Two files, via lib/archive.js:
+ *   log/YYYY-MM-DD.jsonl   append-only, full detail, the complete dataset
+ *   snapshot.json          current state, atomically rewritten, for fast boot
  *
- * Cost shape: Firestore bills per document write, so samples are buffered in
- * RAM and flushed as ONE document per pool every FLUSH_MS (default 10 min),
- * which keeps a 60-80 pool feed inside the free tier's 20k writes/day.
+ * Only samples NEWER than what we already archived are appended, so the log
+ * grows by what was actually observed rather than re-writing whole series.
+ *
+ * No npm dependencies - node:fs only, through lib/archive.js.
  */
 
-const crypto = require("node:crypto");
+const archive = require("./lib/archive");
+// Reads that parse day files run off the main thread - see the file header.
+const offload = require("./lib/archive-offload");
 
-function parseAccount(raw) {
-  if (!raw) return null;
-  const text = raw.trim().startsWith("{")
-    ? raw
-    : Buffer.from(raw, "base64").toString("utf8");
-  try {
-    const parsed = JSON.parse(text);
-    if (parsed && parsed.client_email && parsed.private_key) return parsed;
-  } catch (error) {
-    console.error("store: FIREBASE_SERVICE_ACCOUNT is not valid JSON or base64 JSON");
-  }
-  return null;
-}
+const enabled = process.env.ARCHIVE_DISABLED !== "1" && archive.ensure();
 
-const account = parseAccount(process.env.FIREBASE_SERVICE_ACCOUNT);
-const PROJECT_ID = process.env.FIREBASE_PROJECT_ID || (account && account.project_id) || null;
-const DATABASE = process.env.FIRESTORE_DATABASE || "(default)";
-const enabled = Boolean(account && PROJECT_ID);
-const BASE = enabled
-  ? "https://firestore.googleapis.com/v1/projects/" + PROJECT_ID +
-    "/databases/" + encodeURIComponent(DATABASE) + "/documents"
-  : null;
-
-const FLUSH_MS = Number(process.env.STORE_FLUSH_MS || 600000);
-// Observations are 60s-granularity score/price snapshots, so they tolerate a
-// longer flush. Keeping them on a slower cycle holds total writes under the
-// free tier's 20k/day: ~60 pools every 10min + ~60 tokens every 30min.
-const OBSERVATION_FLUSH_MS = Number(process.env.STORE_OBSERVATION_FLUSH_MS || 1800000);
-const LOAD_LIMIT = Number(process.env.STORE_LOAD_LIMIT || 300);
-const REQUEST_TIMEOUT_MS = Number(process.env.STORE_TIMEOUT_MS || 12000);
+// Disk writes are free, so these are about freshness, not cost. The old cloud
+// values were 600000 / 1800000 and existed only to ration billed writes.
+const FLUSH_MS = Number(process.env.STORE_FLUSH_MS || 30000);
+const OBSERVATION_FLUSH_MS = Number(process.env.STORE_OBSERVATION_FLUSH_MS || 60000);
 
 const stats = {
-  enabled, projectId: PROJECT_ID,
+  enabled,
+  projectId: null,
+  dir: archive.dir,
   writes: 0, reads: 0, errors: 0,
   lastFlushAt: null, lastFlushDocs: 0, lastError: null, loadedAt: null,
-  // Round-trip timings, so the admin panel can show what Firestore costs us.
+  // Round-trip timings, so the admin panel can show what the archive costs us.
   writeLatency: { last: null, avg: null, min: null, max: null, samples: 0 },
   readLatency: { last: null, avg: null, min: null, max: null, samples: 0 },
   lastFlushMs: null, lastLoadMs: null,
+  lastFlushBytes: 0, bytesWritten: 0,
 };
 
 function recordLatency(bucket, ms) {
@@ -70,97 +56,28 @@ function recordLatency(bucket, ms) {
   bucket.samples += 1;
 }
 
-// ---------------------------------------------------------------- auth
-
-let tokenCache = { token: null, expiresAt: 0 };
-
-async function accessToken() {
-  if (tokenCache.token && Date.now() < tokenCache.expiresAt - 60000) return tokenCache.token;
-  const iat = Math.floor(Date.now() / 1000);
-  const encode = (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url");
-  const unsigned = encode({ alg: "RS256", typ: "JWT" }) + "." + encode({
-    iss: account.client_email,
-    scope: "https://www.googleapis.com/auth/datastore",
-    aud: "https://oauth2.googleapis.com/token",
-    iat: iat, exp: iat + 3600,
-  });
-  const signature = crypto.createSign("RSA-SHA256").update(unsigned)
-    .sign(String(account.private_key).replace(/\\n/g, "\n"), "base64url");
-
-  const response = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-      assertion: unsigned + "." + signature,
-    }),
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  });
-  const body = await response.json();
-  if (!response.ok || !body.access_token) {
-    throw new Error("token exchange failed: " + (body.error_description || body.error || response.status));
-  }
-  tokenCache = { token: body.access_token, expiresAt: Date.now() + (body.expires_in || 3600) * 1000 };
-  return tokenCache.token;
+function note(error) {
+  stats.errors += 1;
+  stats.lastError = error && error.message ? error.message : String(error);
 }
 
-async function call(path, options) {
-  const token = await accessToken();
-  const response = await fetch(BASE + path, Object.assign({
-    headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  }, options || {}));
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error("firestore " + response.status + ": " + text.slice(0, 160));
-  }
-  return response.json();
-}
-
-// ------------------------------------------------- value serialisation
-
-// Sample arrays are stored as one JSON string rather than a Firestore array of
-// maps: Firestore counts every field name in every array element toward the
-// 1 MiB document cap, so a JSON string fits roughly 3x more history per doc.
-const str = (v) => ({ stringValue: String(v) });
-const int = (v) => ({ integerValue: String(Math.round(v)) });
-const readStr = (field) => (field && field.stringValue) || "";
-const readInt = (field) => (field && field.integerValue != null ? Number(field.integerValue) : null);
-
+// The id shape the original store used. Kept because the admin panel and the
+// inspect view still address records this way.
 function docId(chainKey, address) {
   return chainKey + "__" + String(address).replace(/\//g, "_");
 }
 
-async function writeDoc(collection, id, fields) {
-  const startedAt = Date.now();
-  const result = await call("/" + collection + "/" + encodeURIComponent(id), {
-    method: "PATCH",
-    body: JSON.stringify({ fields: fields }),
-  });
-  recordLatency(stats.writeLatency, Date.now() - startedAt);
-  return result;
-}
-
-async function readCollection(collection) {
-  const out = [];
-  let pageToken = null;
-  do {
-    const query = "?pageSize=" + LOAD_LIMIT + (pageToken ? "&pageToken=" + encodeURIComponent(pageToken) : "");
-    const readStartedAt = Date.now();
-    const page = await call("/" + collection + query, { method: "GET" });
-    recordLatency(stats.readLatency, Date.now() - readStartedAt);
-    (page.documents || []).forEach((doc) => out.push(doc));
-    pageToken = page.nextPageToken || null;
-    stats.reads += (page.documents || []).length;
-  } while (pageToken && out.length < LOAD_LIMIT * 10);
-  return out;
-}
-
-// ---------------------------------------------------------------- api
+/* ---------------------------------------------------------------- api -- */
 
 const dirtyPools = new Set();
 const dirtyHolders = new Set();
 const dirtyObservations = new Set();
+
+// The high-water mark per key: the timestamp of the newest sample already in
+// the log. Without this, every flush would re-append whole series and a day's
+// log would be far larger than what was actually observed.
+const archivedUpTo = new Map();
+
 let flushTimer = null;
 let observationTimer = null;
 let flushing = false;
@@ -170,61 +87,104 @@ function touchPool(chainKey, poolAddress) { if (enabled) dirtyPools.add(docId(ch
 function touchHolders(chainKey, tokenAddress) { if (enabled) dirtyHolders.add(docId(chainKey, tokenAddress)); }
 function touchObservation(chainKey, tokenAddress) { if (enabled) dirtyObservations.add(docId(chainKey, tokenAddress)); }
 
+/** The samples of a series we have not archived yet, oldest first. */
+function freshSamples(key, samples) {
+  const since = archivedUpTo.get(key) || 0;
+  const fresh = samples.filter((s) => s && Number(s.t) > since);
+  if (fresh.length) archivedUpTo.set(key, Number(fresh[fresh.length - 1].t));
+  return fresh;
+}
+
+/** "base:0xabc" -> "base__0xabc", matching docId. */
+function keyToId(key) {
+  const cut = key.indexOf(":");
+  if (cut < 0) return docId("", key);
+  return docId(key.slice(0, cut), key.slice(cut + 1));
+}
+
 /**
- * Reads every persisted series back into the caller's in-memory Maps.
+ * Reads the snapshot back into the caller's in-memory Maps.
  * Returns counts so the boot log can report what came back.
  */
 async function load(stores) {
   if (!enabled) return { enabled: false };
   const counts = { pools: 0, holders: 0, observations: 0 };
   const loadStartedAt = Date.now();
-  const note = (error) => {
-    stats.errors += 1;
-    stats.lastError = error.message;
-    console.error("store: read failed -", error.message);
-    return [];
-  };
   try {
-    const pools = await readCollection("poolHistory").catch(note);
-    pools.forEach((doc) => {
-      const id = doc.name.split("/").pop();
-      const samples = JSON.parse(readStr(doc.fields && doc.fields.samples) || "[]");
+    const snap = archive.readSnapshot();
+    if (!snap) {
+      stats.loadedAt = Date.now();
+      stats.lastLoadMs = Date.now() - loadStartedAt;
+      return Object.assign({ enabled: true, empty: true }, counts);
+    }
+
+    Object.keys(snap.pools || {}).forEach((key) => {
+      const entry = snap.pools[key];
+      const samples = (entry && entry.samples) || [];
       if (!Array.isArray(samples) || !samples.length) return;
-      const key = id.replace("__", ":");
-      stores.historyStore.set(key, { samples: samples, touchedAt: Date.now() });
+      stores.historyStore.set(key, {
+        samples: samples,
+        symbol: entry.symbol || "",
+        tokenAddress: entry.tokenAddress || "",
+        touchedAt: Date.now(),
+      });
+      // Resume the high-water mark, so a restart does not re-append history
+      // that is already in an earlier day's log.
+      archivedUpTo.set(keyToId(key), Number(samples[samples.length - 1].t) || 0);
       counts.pools += 1;
     });
 
-    const holders = await readCollection("holders").catch(note);
-    holders.forEach((doc) => {
-      const id = doc.name.split("/").pop();
-      const series = JSON.parse(readStr(doc.fields && doc.fields.series) || "[]");
+    Object.keys(snap.holders || {}).forEach((key) => {
+      const series = snap.holders[key];
       if (!Array.isArray(series) || !series.length) return;
-      stores.holderHistory.set(id.replace("__", ":"), series);
+      stores.holderHistory.set(key, series);
+      archivedUpTo.set("holders:" + keyToId(key), Number(series[series.length - 1].t) || 0);
       counts.holders += 1;
     });
 
-    // Score/price snapshots per token - the series outcome tracking reads.
     if (stores.observationStore) {
-      const observations = await readCollection("observations").catch(note);
-      observations.forEach((doc) => {
-        const id = doc.name.split("/").pop();
-        const series = JSON.parse(readStr(doc.fields && doc.fields.series) || "[]");
+      Object.keys(snap.observations || {}).forEach((key) => {
+        const series = snap.observations[key];
         if (!Array.isArray(series) || !series.length) return;
-        stores.observationStore.set(id.replace("__", ":"), series);
+        stores.observationStore.set(key, series);
+        archivedUpTo.set("obs:" + keyToId(key), Number(series[series.length - 1].t) || 0);
         counts.observations += 1;
       });
     }
+
+    stats.reads += counts.pools + counts.holders + counts.observations;
     stats.loadedAt = Date.now();
     stats.lastLoadMs = Date.now() - loadStartedAt;
+    recordLatency(stats.readLatency, stats.lastLoadMs);
   } catch (error) {
-    stats.errors += 1;
-    stats.lastError = error.message;
+    note(error);
   }
   return Object.assign({ enabled: true }, counts);
 }
 
-/** Writes everything marked dirty. Called on a timer and on shutdown. */
+/** Rewrites snapshot.json from the live Maps. Atomic; see lib/archive.js. */
+function snapshot(stores) {
+  const state = { at: Date.now(), pools: {}, holders: {}, observations: {} };
+  stores.historyStore.forEach((series, key) => {
+    if (!series || !series.samples || !series.samples.length) return;
+    state.pools[key] = {
+      samples: series.samples,
+      symbol: series.symbol || "",
+      tokenAddress: series.tokenAddress || "",
+    };
+  });
+  stores.holderHistory.forEach((series, key) => {
+    if (Array.isArray(series) && series.length) state.holders[key] = series;
+  });
+  if (stores.observationStore) {
+    stores.observationStore.forEach((series, key) => {
+      if (Array.isArray(series) && series.length) state.observations[key] = series;
+    });
+  }
+  return archive.writeSnapshot(state);
+}
+
+/** Appends everything marked dirty. Called on a timer and on shutdown. */
 async function flush(stores, reason) {
   if (!enabled || flushing) return 0;
   const pools = Array.from(dirtyPools); dirtyPools.clear();
@@ -234,83 +194,158 @@ async function flush(stores, reason) {
   flushing = true;
   const flushStartedAt = Date.now();
   let written = 0;
+  let bytes = 0;
   try {
     for (const id of pools) {
-      const series = stores.historyStore.get(id.replace("__", ":"));
+      const key = id.replace("__", ":");
+      const series = stores.historyStore.get(key);
       if (!series || !series.samples || !series.samples.length) continue;
-      const [chainKey, pool] = id.split("__");
-      const first = series.samples[0];
-      const last = series.samples[series.samples.length - 1];
-      await writeDoc("poolHistory", id, {
-        chain: str(chainKey), pool: str(pool),
-        // Identity, so a document is readable without cross-referencing the feed.
-        symbol: str(series.symbol || ""),
-        token: str(series.tokenAddress || ""),
-        updatedAt: int(Date.now()),
-        sampleCount: int(series.samples.length),
-        firstSampleAt: int(first.t), lastSampleAt: int(last.t),
-        samples: str(JSON.stringify(series.samples)),
+      const fresh = freshSamples(id, series.samples);
+      if (!fresh.length) continue;
+      const parts = id.split("__");
+      bytes += archive.append({
+        kind: "pool",
+        chain: parts[0], pool: parts[1],
+        // Identity, so a line is readable without cross-referencing the feed.
+        symbol: series.symbol || "",
+        token: series.tokenAddress || "",
+        from: fresh[0].t, to: fresh[fresh.length - 1].t,
+        n: fresh.length,
+        samples: fresh,
       });
       written += 1;
     }
+
     for (const id of holders) {
-      const series = stores.holderHistory.get(id.replace("__", ":"));
+      const key = id.replace("__", ":");
+      const series = stores.holderHistory.get(key);
       if (!series || !series.length) continue;
-      const [chainKey, token] = id.split("__");
-      await writeDoc("holders", id, {
-        chain: str(chainKey), token: str(token),
-        series: str(JSON.stringify(series)), updatedAt: int(Date.now()),
+      const fresh = freshSamples("holders:" + id, series);
+      if (!fresh.length) continue;
+      const parts = id.split("__");
+      bytes += archive.append({
+        kind: "holders",
+        chain: parts[0], token: parts[1],
+        n: fresh.length, series: fresh,
       });
       written += 1;
     }
+
+    bytes += snapshot(stores);
+
     stats.writes += written;
+    stats.bytesWritten += bytes;
+    stats.lastFlushBytes = bytes;
     stats.lastFlushAt = Date.now();
     stats.lastFlushMs = Date.now() - flushStartedAt;
     stats.lastFlushDocs = written;
-    if (written) console.log("store: flushed " + written + " docs (" + (reason || "timer") + ")");
+    recordLatency(stats.writeLatency, stats.lastFlushMs);
+    if (written) console.log("store: archived " + written + " records, " + bytes + "B (" + (reason || "timer") + ")");
   } catch (error) {
-    stats.errors += 1;
-    stats.lastError = error.message;
-    console.error("store: flush failed -", error.message);
+    note(error);
+    console.error("store: flush failed -", stats.lastError);
   } finally {
     flushing = false;
   }
   return written;
 }
 
-/**
- * Score/price snapshots, on their own slower cycle. One document per token
- * holds the whole series, so a longer interval costs nothing but writes.
- */
+/** Score/price snapshots, on their own cycle. */
 async function flushObservations(stores, reason) {
   if (!enabled || !stores.observationStore) return 0;
   const ids = Array.from(dirtyObservations);
   dirtyObservations.clear();
   if (!ids.length) return 0;
   let written = 0;
+  let bytes = 0;
   try {
     for (const id of ids) {
       const series = stores.observationStore.get(id.replace("__", ":"));
       if (!series || !series.length) continue;
-      const [chainKey, token] = id.split("__");
-      const last = series[series.length - 1];
-      await writeDoc("observations", id, {
-        chain: str(chainKey), token: str(token),
-        symbol: str(last.symbol || ""),
-        sampleCount: int(series.length),
-        firstSampleAt: int(series[0].t), lastSampleAt: int(last.t),
-        series: str(JSON.stringify(series)), updatedAt: int(Date.now()),
+      const fresh = freshSamples("obs:" + id, series);
+      if (!fresh.length) continue;
+      const parts = id.split("__");
+      const last = fresh[fresh.length - 1];
+      bytes += archive.append({
+        kind: "observation",
+        chain: parts[0], token: parts[1],
+        symbol: last.symbol || "",
+        from: fresh[0].t, to: last.t,
+        n: fresh.length, series: fresh,
       });
       written += 1;
     }
+    // The snapshot must be rewritten here too, not only in flush(). The two
+    // run on separate timers and in parallel during flushAll, so relying on a
+    // pool flush to carry observations into the boot file left them archived
+    // in the log but absent on reload.
+    if (written) bytes += snapshot(stores);
+
     stats.writes += written;
-    if (written) console.log("store: flushed " + written + " observation docs (" + (reason || "timer") + ")");
+    stats.bytesWritten += bytes;
+    if (written) console.log("store: archived " + written + " observation records, " + bytes + "B (" + (reason || "timer") + ")");
   } catch (error) {
-    stats.errors += 1;
-    stats.lastError = error.message;
-    console.error("store: observation flush failed -", error.message);
+    note(error);
+    console.error("store: observation flush failed -", stats.lastError);
   }
   return written;
+}
+
+/* ---- wallet trades ---------------------------------------------------- */
+
+/**
+ * Wallet-level trades, archived as they are sampled.
+ *
+ * GeckoTerminal returns a pool's last ~300 trades, so consecutive samples
+ * overlap heavily. Trades carry no id, so identity is (time, wallet, side,
+ * size); a per-pool high-water mark plus the keys AT that mark means each
+ * trade lands in the log once, however many samples it appeared in.
+ */
+const tradeMarks = new Map();
+const tradeKey = (x) => x.at + "|" + x.wallet + "|" + x.kind + "|" + x.usd;
+
+function markFrom(trades) {
+  let top = 0;
+  (trades || []).forEach((x) => { if (Number.isFinite(x.at) && x.at > top) top = x.at; });
+  const keys = new Set();
+  (trades || []).forEach((x) => { if (x.at === top) keys.add(tradeKey(x)); });
+  return { t: top, keys: keys };
+}
+
+/** Marks trades already on disk (from a restored sample) as archived. */
+function seedTradeMark(chainKey, poolAddress, trades) {
+  const id = "trades:" + docId(chainKey, poolAddress);
+  if (!tradeMarks.has(id)) tradeMarks.set(id, markFrom(trades));
+}
+
+/** Appends the trades not archived before. Returns how many were new. */
+function archiveTrades(chainKey, poolAddress, symbol, trades) {
+  if (!enabled) return 0;
+  const id = "trades:" + docId(chainKey, poolAddress);
+  const mark = tradeMarks.get(id) || { t: 0, keys: new Set() };
+  const fresh = (trades || [])
+    .filter((x) => x && Number.isFinite(x.at) &&
+      (x.at > mark.t || (x.at === mark.t && !mark.keys.has(tradeKey(x)))))
+    .sort((p, q) => p.at - q.at);
+  if (!fresh.length) return 0;
+  try {
+    const bytes = archive.append({
+      kind: "trades",
+      chain: chainKey, pool: poolAddress, symbol: symbol || "",
+      from: fresh[0].at, to: fresh[fresh.length - 1].at,
+      n: fresh.length, trades: fresh,
+    });
+    const top = fresh[fresh.length - 1].at;
+    const keys = top === mark.t ? mark.keys : new Set();
+    fresh.forEach((x) => { if (x.at === top) keys.add(tradeKey(x)); });
+    tradeMarks.set(id, { t: top, keys: keys });
+    stats.writes += 1;
+    stats.bytesWritten += bytes;
+    return fresh.length;
+  } catch (error) {
+    note(error);
+    return 0;
+  }
 }
 
 function startAutoFlush(stores) {
@@ -332,74 +367,95 @@ function stopAutoFlush() {
   if (observationTimer) { clearInterval(observationTimer); observationTimer = null; }
 }
 
-/** Everything, for shutdown. */
+/** Everything, for shutdown. fsync last, so a kill after this loses nothing. */
 function flushAll(stores, reason) {
   return Promise.all([flush(stores, reason), flushObservations(stores, reason)])
-    .then(([a, b]) => a + b);
+    .then(async (counts) => { await archive.sync(); return counts[0] + counts[1]; });
 }
 
-
 /**
- * Measures an actual Firestore round trip: one write, then one read back of
- * the same document. Used by the admin panel's "test now" button so the
- * numbers shown are current rather than averaged over the process lifetime.
+ * Measures an actual disk round trip: one append + fsync, then one read back.
+ * Used by the admin panel's "test now" button.
  */
 async function probe() {
-  if (!enabled) return { enabled: false };
-  const id = "_probe";
+  if (!enabled) return { enabled: false, error: archive.error };
   const stamp = Date.now();
-  const out = { enabled: true, at: stamp };
+  const out = { enabled: true, at: stamp, dir: archive.dir };
   try {
     const w0 = Date.now();
-    await writeDoc("_admin", id, { at: int(stamp), note: str("admin panel latency probe") });
+    archive.append({ kind: "_probe", at: stamp, note: "admin panel latency probe" });
+    await archive.sync();
     out.writeMs = Date.now() - w0;
 
     const r0 = Date.now();
-    const doc = await call("/_admin/" + id, { method: "GET" });
+    // The line was appended a moment ago, so it is in the file's last few KB.
+    // Reading the whole day to find it parsed ~200MB every five minutes.
+    const found = archive.readTail({
+      day: new Date(stamp).toISOString().slice(0, 10),
+      kind: "_probe",
+    }).filter((r) => r.at === stamp);
     out.readMs = Date.now() - r0;
     out.roundTripMs = out.writeMs + out.readMs;
-    out.verified = readInt(doc.fields && doc.fields.at) === stamp;
+    out.verified = found.length === 1;
+    out.usage = archive.usage();
   } catch (error) {
     out.error = error.message;
-    stats.errors += 1;
-    stats.lastError = error.message;
+    note(error);
   }
   return out;
 }
 
+// The collection names the admin panel asks for, mapped onto the `kind`
+// written into the log.
+const COLLECTION_KIND = {
+  poolHistory: "pool",
+  observations: "observation",
+  holders: "holders",
+  stages: "app:stage",
+  trades: "trades",
+};
+
 /**
- * Lists a collection's documents without their heavy series payloads, so the
- * admin panel can show what is stored and how fresh it is.
+ * Lists recent records without their heavy series payloads, so the admin panel
+ * can show what is stored and how fresh it is. Same document shape the
+ * original store returned, so the panel renders unchanged.
  */
 async function inspect(collection, limit) {
   if (!enabled) return { enabled: false, documents: [] };
   const max = Math.min(Number(limit) || 25, 100);
+  const kind = COLLECTION_KIND[collection] || collection;
   const startedAt = Date.now();
-  const page = await call("/" + collection + "?pageSize=" + max, { method: "GET" });
-  const documents = (page.documents || []).map((doc) => {
-    const f = doc.fields || {};
-    const series = readStr(f.samples) || readStr(f.series) || readStr(f.history) || "";
-    return {
-      id: doc.name.split("/").pop(),
-      chain: readStr(f.chain) || null,
-      symbol: readStr(f.symbol) || null,
-      token: readStr(f.token) || null,
-      pool: readStr(f.pool) || null,
-      stage: readStr(f.stage) || readStr(f.lastStage) || null,
-      sampleCount: readInt(f.sampleCount),
-      firstSampleAt: readInt(f.firstSampleAt),
-      lastSampleAt: readInt(f.lastSampleAt),
-      updatedAt: readInt(f.updatedAt),
-      payloadBytes: series.length,
-      createTime: doc.createTime || null,
-    };
-  });
+  // Newest day first; the newest record per id wins. On the read worker: a
+  // kind with no records (app:stage, often) reads every day file to say so.
+  const rows = await offload.call("read", { kind, limit: max * 20 });
+  const seen = new Map();
+  for (let i = rows.length - 1; i >= 0 && seen.size < max; i -= 1) {
+    const r = rows[i];
+    const id = docId(r.chain || "", r.pool || r.token || r.id || "");
+    if (seen.has(id)) continue;
+    const series = r.samples || r.series || [];
+    const last = series[series.length - 1];
+    seen.set(id, {
+      id: id,
+      chain: r.chain || null,
+      symbol: r.symbol || null,
+      token: r.token || null,
+      pool: r.pool || null,
+      stage: r.stage || null,
+      sampleCount: r.n || series.length || null,
+      firstSampleAt: r.from || (series[0] && series[0].t) || null,
+      lastSampleAt: r.to || (last && last.t) || null,
+      updatedAt: r.t || null,
+      payloadBytes: JSON.stringify(series).length,
+      createTime: null,
+    });
+  }
   return {
     enabled: true, collection: collection,
     fetchedInMs: Date.now() - startedAt,
-    count: documents.length,
-    hasMore: Boolean(page.nextPageToken),
-    documents: documents,
+    count: seen.size,
+    hasMore: rows.length >= max * 20,
+    documents: Array.from(seen.values()),
   };
 }
 
@@ -411,11 +467,97 @@ function pending() {
   };
 }
 
+function usage() { return archive.usage(); }
+
+/**
+ * A graded verdict on whether the archive is actually working, rather than a
+ * pile of numbers the panel has to interpret. Each problem carries its own
+ * sentence, because "DEGRADED" with no reason is not worth showing.
+ *
+ * Levels: ok | degraded | failed.
+ */
+function health() {
+  const problems = [];
+  let level = "ok";
+
+  if (!enabled) {
+    return {
+      level: "failed",
+      summary: "Not archiving - nothing survives a restart.",
+      problems: [archive.error || "archive disabled by ARCHIVE_DISABLED"],
+    };
+  }
+
+  if (archive.error) {
+    level = "failed";
+    problems.push("Last disk operation failed: " + archive.error);
+  }
+
+  if (stats.errors > 0) {
+    if (level !== "failed") level = "degraded";
+    problems.push(stats.errors + " error(s) this process; last was: " + (stats.lastError || "unknown"));
+  }
+
+  // A flush that has not run in several intervals means the timer stalled or
+  // every flush is throwing - either way the log is behind what is in RAM.
+  const sinceFlush = stats.lastFlushAt ? Date.now() - stats.lastFlushAt : null;
+  if (sinceFlush !== null && sinceFlush > FLUSH_MS * 4) {
+    if (level !== "failed") level = "degraded";
+    problems.push("No flush for " + Math.round(sinceFlush / 1000) + "s (interval is " +
+      Math.round(FLUSH_MS / 1000) + "s).");
+  }
+
+  // The dirty sets should drain every flush. A large standing queue means
+  // writes are failing silently or the series are being touched faster than
+  // they can be written.
+  const queued = pending();
+  const totalQueued = queued.pools + queued.holders + queued.observations;
+  if (totalQueued > 2000) {
+    if (level !== "failed") level = "degraded";
+    problems.push(totalQueued + " records queued and not yet written.");
+  }
+
+  const use = archive.usage();
+  if (!use.ok) {
+    level = "failed";
+    problems.push("Cannot read the archive directory: " + (use.error || "unknown"));
+  }
+
+  const summary = level === "ok"
+    ? "Archiving to disk, flushing every " + Math.round(FLUSH_MS / 1000) + "s."
+    : level === "degraded"
+      ? "Archiving, but something is behind or erroring."
+      : "Not archiving reliably - data is being lost.";
+
+  return {
+    level, summary, problems,
+    sinceFlushMs: sinceFlush,
+    queued: totalQueued,
+    writtenByKind: archive.writtenByKind(),
+  };
+}
+
+// Each of these parses day files - up to a week of them - so they run on the
+// read worker and return Promises. Called inline they froze the server long
+// enough for the supervisor to kill it (2026-10-07).
+function scan() { return offload.call("scan"); }
+const seriesSince = (options) => offload.call("seriesSince", options);
+const coverage = (options) => offload.call("coverage", options);
+const timeline = (options) => offload.call("timeline", options);
+
 module.exports = {
   enabled, stats,
+  backend: "disk",
+  dir: archive.dir,
   flushIntervalMs: FLUSH_MS,
   observationFlushIntervalMs: OBSERVATION_FLUSH_MS,
   load, flush, flushObservations, flushAll, startAutoFlush, stopAutoFlush,
   touchPool, touchHolders, touchObservation,
-  probe, inspect, pending,
+  archiveTrades, seedTradeMark,
+  probe, inspect, pending, usage, health, scan,
+  seriesSince, coverage, timeline,
+  compact: archive.compact, dayFiles: archive.dayFiles,
+  rawDays: archive.RETAIN_RAW_DAYS, rollupMs: archive.ROLLUP_MS,
+  close: archive.close, stopReader: offload.stop,
+  read: archive.read, days: archive.days,
 };

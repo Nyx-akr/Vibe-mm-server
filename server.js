@@ -761,6 +761,14 @@ async function collectPerps() {
   // least urgent things here, and boot is the busiest the loop ever gets.
   if (process.uptime() < 45) return { idle: true, reason: "boot" };
   const data = await perps.fetchPerpVenues();
+  // A pass where NO venue answered is a network blip, not "no perps anywhere"
+  // - writing it would blank every token's whitespace until the next pass.
+  // Keep the last good list and say so; a partial answer is still written.
+  const previous = raw.read("perps.json");
+  if (!data.venuesReachable && previous && previous.venuesReachable) {
+    return { venues: "0/" + data.venuesTotal, kept: "previous list from " +
+      new Date(previous.writtenAt).toISOString() };
+  }
   raw.write("perps.json", data);
   return {
     venues: data.venuesReachable + "/" + data.venuesTotal,
@@ -972,9 +980,10 @@ async function collectPromotion() {
  * archive supplies the rest and RAM is folded on top (the archive lags by up
  * to one flush, so the newest points exist only in RAM).
  */
-function observationsSince(chainKey, since) {
+async function observationsSince(chainKey, since) {
+  const deep = await store.seriesSince({ kind: "observation", chain: chainKey, since: since });
+  // Read RAM after the archive answers, so the hot window is the newest one.
   const hot = memory.observationsFor(chainKey);
-  const deep = store.seriesSince({ kind: "observation", chain: chainKey, since: since });
   const tokens = {};
   deep.series.forEach((rows, key) => {
     if (!key.startsWith(chainKey + ":")) return;
@@ -996,7 +1005,7 @@ async function collectDeep() {
   if (!store.enabled) return { skipped: "archive disabled" };
   const since = Date.now() - 48 * 3600000;
   for (const chainKey of DEEP_CHAINS) {
-    const out = observationsSince(chainKey, since);
+    const out = await observationsSince(chainKey, since);
     raw.write(chainKey + "/observations-48h.json", {
       chain: chainKey, since: since, source: "memory+archive",
       series: Object.keys(out.tokens).length, tookMs: out.tookMs, tokens: out.tokens,
@@ -1015,16 +1024,12 @@ async function collectCoverage() {
   const now = Date.now();
   const kind = "observation";
   const byChain = {};
-  DEEP_CHAINS.forEach((chainKey) => {
-    byChain[chainKey] = store.coverage({ kind, chain: chainKey, since: now - 86400000, until: now, bucketMs: 300000 });
-  });
-  raw.write("coverage.json", {
-    now: now,
-    kind: kind,
-    day: store.timeline({ kind, chain: null, since: now - 86400000, until: now, buckets: 96, lostGapMs: 1800000 }),
-    week: store.timeline({ kind, chain: null, since: now - 7 * 86400000, until: now, buckets: 56, lostGapMs: 1800000 }),
-    byChain: byChain,
-  });
+  for (const chainKey of DEEP_CHAINS) {
+    byChain[chainKey] = await store.coverage({ kind, chain: chainKey, since: now - 86400000, until: now, bucketMs: 300000 });
+  }
+  const day = await store.timeline({ kind, chain: null, since: now - 86400000, until: now, buckets: 96, lostGapMs: 1800000 });
+  const week = await store.timeline({ kind, chain: null, since: now - 7 * 86400000, until: now, buckets: 56, lostGapMs: 1800000 });
+  raw.write("coverage.json", { now: now, kind: kind, day: day, week: week, byChain: byChain });
   return { chains: DEEP_CHAINS.length };
 }
 
@@ -1047,7 +1052,7 @@ async function collectProbe() {
 
 async function collectScan() {
   if (!store.enabled) return { skipped: "archive disabled" };
-  try { lastScan = store.scan(); } catch (error) { lastScan = { ok: false, error: error.message }; }
+  try { lastScan = await store.scan(); } catch (error) { lastScan = { ok: false, error: error.message }; }
   return { records: lastScan && lastScan.records };
 }
 
